@@ -37,6 +37,11 @@ export type PlayerPosition = {
   world_y: number | null
 }
 
+export type RemotePlayerSnapshot = {
+  user_id: string
+  position: PlayerPosition
+}
+
 export type InventoryItem = {
   block_id: number
   inventory_type: number
@@ -73,6 +78,7 @@ export type MinimapSnapshot = {
   water_tiles: number[]
   wiring_tiles: number[]
   player_position: PlayerPosition
+  other_players: RemotePlayerSnapshot[]
 }
 
 export type ApiMessage = {

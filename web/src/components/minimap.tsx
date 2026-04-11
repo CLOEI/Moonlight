@@ -110,11 +110,21 @@ export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) 
   const drawPlayer = useCallback(
     (graphics: Graphics) => {
       graphics.clear()
-      if (
-        !minimap ||
-        playerPosition.map_x == null ||
-        playerPosition.map_y == null
-      ) {
+      if (!minimap) {
+        return
+      }
+      for (const otherPlayer of minimap.other_players) {
+        const { map_x, map_y } = otherPlayer.position
+        if (map_x == null || map_y == null) {
+          continue
+        }
+        const x = Math.min(Math.max(map_x, 0), minimap.width - 1)
+        const y = Math.min(Math.max(map_y, 0), minimap.height - 1)
+        graphics.setFillStyle({ color: 0xa855f7 })
+        graphics.circle(x + 0.5, minimap.height - y - 0.5, 0.32)
+        graphics.fill()
+      }
+      if (playerPosition.map_x == null || playerPosition.map_y == null) {
         return
       }
       const x = Math.min(Math.max(playerPosition.map_x, 0), minimap.width - 1)

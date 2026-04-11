@@ -10,6 +10,7 @@ pub const PACKET_ID_UPDATE_LOCATION: &str = "ULS";
 pub const PACKET_ID_READY_TO_PLAY: &str = "RtP";
 pub const PACKET_ID_MAP_POINT: &str = "mp";
 pub const PACKET_ID_MOVEMENT: &str = "mP";
+pub const PACKET_ID_PLAYER_LEAVE: &str = "PL";
 pub const PACKET_ID_REDIRECT: &str = "OoIP";
 pub const PACKET_ID_ALREADY_CONNECTED: &str = "AC";
 pub const PACKET_ID_R_OP: &str = "rOP";

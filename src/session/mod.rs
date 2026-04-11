@@ -20,8 +20,8 @@ use crate::lua_runtime::{self, LuaScriptHandle};
 use crate::models::{
     AuthInput, InventoryItem, LuaCollectableSnapshot, LuaGrowingTileSnapshot,
     LuaScriptStatusSnapshot, LuaTileSnapshot, LuaWorldObjectsSnapshot, LuaWorldSnapshot,
-    LuaWorldSpawnSnapshot, LuaWorldTilesSnapshot, MinimapSnapshot, PlayerPosition, SessionSnapshot,
-    SessionStatus, TileCount, WorldSnapshot,
+    LuaWorldSpawnSnapshot, LuaWorldTilesSnapshot, MinimapSnapshot, PlayerPosition,
+    RemotePlayerSnapshot, SessionSnapshot, SessionStatus, TileCount, WorldSnapshot,
 };
 use crate::net;
 use crate::pathfinding::astar;
@@ -161,6 +161,7 @@ impl BotSession {
                 world_x: None,
                 world_y: None,
             },
+            other_players: HashMap::new(),
             inventory: Vec::new(),
             collectables: HashMap::new(),
             last_error: None,
@@ -246,6 +247,14 @@ impl BotSession {
             water_tiles: state.world_water_tiles.clone(),
             wiring_tiles: state.world_wiring_tiles.clone(),
             player_position: state.player_position.clone(),
+            other_players: state
+                .other_players
+                .iter()
+                .map(|(user_id, position)| RemotePlayerSnapshot {
+                    user_id: user_id.clone(),
+                    position: position.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -758,6 +767,7 @@ impl BotSession {
                             let mut state = self.state.write().await;
                             state.pending_world = Some(world.to_uppercase());
                             state.status = SessionStatus::JoiningWorld;
+                            state.other_players.clear();
                         }
                         self.publish_snapshot().await;
                         if let Some(active) = &runtime {
@@ -1199,7 +1209,10 @@ impl BotSession {
             | ids::PACKET_ID_GET_LSI => {}
             ids::PACKET_ID_GPD => self.apply_profile(&message).await,
             ids::PACKET_ID_MOVEMENT | "U" | "AnP" => {
-                self.maybe_update_local_position(&message).await;
+                self.maybe_update_player_positions(&message).await;
+            }
+            ids::PACKET_ID_PLAYER_LEAVE => {
+                self.remove_other_player(&message).await;
             }
             "A" => {
                 self.maybe_apply_spawn_pot_selection(&message).await;
@@ -1275,6 +1288,7 @@ impl BotSession {
                         let mut state = self.state.write().await;
                         state.current_world = world.clone();
                         state.status = SessionStatus::LoadingWorld;
+                        state.other_players.clear();
                     }
                     self.publish_snapshot().await;
                     if let Some(world) = world {
@@ -1297,6 +1311,7 @@ impl BotSession {
                     state.world_wiring_tiles = decoded_world.wiring_tiles;
                     state.growing_tiles.clear();
                     state.collectables.clear();
+                    state.other_players.clear();
                     state.player_position = PlayerPosition {
                         map_x: decoded_world.snapshot.spawn_map_x,
                         map_y: decoded_world.snapshot.spawn_map_y,
@@ -1421,6 +1436,7 @@ impl BotSession {
             state.current_outbound_tx = None;
             state.growing_tiles.clear();
             state.collectables.clear();
+            state.other_players.clear();
             state.player_position = PlayerPosition {
                 map_x: None,
                 map_y: None,
@@ -1441,36 +1457,49 @@ impl BotSession {
         self.logger.session_snapshot(snapshot);
     }
 
-    async fn maybe_update_local_position(&self, message: &Document) {
+    async fn maybe_update_player_positions(&self, message: &Document) {
         let packet_uid = message.get_str("U").ok();
         let local_uid = self.state.read().await.user_id.clone();
-        // Only update from mP packets that explicitly carry our own user ID.
-        // Packets with no U field are other players' broadcasts — skip them.
-        if packet_uid.map(str::to_string) != local_uid {
+        if let Some(uid) = packet_uid {
+            let mut state = self.state.write().await;
+            if local_uid.as_deref() == Some(uid) {
+                let changed = update_player_position_from_message(message, &mut state.player_position);
+                drop(state);
+                if changed {
+                    self.publish_snapshot().await;
+                }
+                return;
+            }
+
+            let remote = state
+                .other_players
+                .entry(uid.to_string())
+                .or_insert(PlayerPosition {
+                    map_x: None,
+                    map_y: None,
+                    world_x: None,
+                    world_y: None,
+                });
+            let changed = update_player_position_from_message(message, remote);
+            drop(state);
+            if changed {
+                self.publish_snapshot().await;
+            }
+            return;
+        }
+    }
+
+    async fn remove_other_player(&self, message: &Document) {
+        let Ok(user_id) = message.get_str("U") else {
+            return;
+        };
+        let local_uid = self.state.read().await.user_id.clone();
+        if local_uid.as_deref() == Some(user_id) {
             return;
         }
 
-        let mut state = self.state.write().await;
-        let previous = state.player_position.clone();
-        if let Ok(x) = message.get_f64("x") {
-            state.player_position.world_x = Some(x);
-            let (map_x, _) =
-                protocol::world_to_map(x, state.player_position.world_y.unwrap_or_default());
-            state.player_position.map_x = Some(map_x);
-        }
-        if let Ok(y) = message.get_f64("y") {
-            state.player_position.world_y = Some(y);
-            let (_, map_y) =
-                protocol::world_to_map(state.player_position.world_x.unwrap_or_default(), y);
-            state.player_position.map_y = Some(map_y);
-        }
-        let changed = state.player_position.map_x != previous.map_x
-            || state.player_position.map_y != previous.map_y
-            || state.player_position.world_x != previous.world_x
-            || state.player_position.world_y != previous.world_y;
-        drop(state);
-
-        if changed {
+        let removed = self.state.write().await.other_players.remove(user_id).is_some();
+        if removed {
             self.publish_snapshot().await;
         }
     }
@@ -1650,6 +1679,25 @@ impl BotSession {
     }
 }
 
+fn update_player_position_from_message(message: &Document, position: &mut PlayerPosition) -> bool {
+    let previous = position.clone();
+    if let Ok(x) = message.get_f64("x") {
+        position.world_x = Some(x);
+        let (map_x, _) = protocol::world_to_map(x, position.world_y.unwrap_or_default());
+        position.map_x = Some(map_x);
+    }
+    if let Ok(y) = message.get_f64("y") {
+        position.world_y = Some(y);
+        let (_, map_y) = protocol::world_to_map(position.world_x.unwrap_or_default(), y);
+        position.map_y = Some(map_y);
+    }
+
+    position.map_x != previous.map_x
+        || position.map_y != previous.map_y
+        || position.world_x != previous.world_x
+        || position.world_y != previous.world_y
+}
+
 #[derive(Debug)]
 struct ActiveRuntime {
     id: u64,
@@ -1764,6 +1812,7 @@ struct SessionState {
     current_outbound_tx: Option<mpsc::Sender<OutboundEnvelope>>,
     growing_tiles: HashMap<(i32, i32), GrowingTileState>,
     player_position: PlayerPosition,
+    other_players: HashMap<String, PlayerPosition>,
     inventory: Vec<InventoryEntry>,
     collectables: HashMap<i32, CollectableState>,
     last_error: Option<String>,
@@ -3155,6 +3204,7 @@ async fn ensure_world_cancellable(
             state.world_water_tiles.clear();
             state.world_wiring_tiles.clear();
             state.collectables.clear();
+            state.other_players.clear();
         }
         let eid = if world == tutorial::TUTORIAL_WORLD {
             "Start"
@@ -3651,11 +3701,19 @@ async fn movement_doc(state: &Arc<RwLock<SessionState>>, anim: i32, direction: i
 mod tests {
     use std::collections::HashMap;
 
+    use bson::doc;
+
     use super::{
-        FishingAutomationState, GrowingTileState, SessionState, apply_destroy_block_change,
-        apply_foreground_block_change, is_tile_ready_to_harvest_at,
+        BotSession, FishingAutomationState, GrowingTileState, SessionState,
+        apply_destroy_block_change, apply_foreground_block_change, is_tile_ready_to_harvest_at,
+        update_player_position_from_message,
     };
-    use crate::models::{PlayerPosition, SessionStatus, WorldSnapshot};
+    use crate::{
+        logging::{EventHub, Logger},
+        models::{PlayerPosition, SessionStatus, WorldSnapshot},
+        protocol,
+    };
+    use std::sync::Arc;
 
     fn test_state(
         width: u32,
@@ -3696,6 +3754,7 @@ mod tests {
                 world_x: None,
                 world_y: None,
             },
+            other_players: HashMap::new(),
             inventory: Vec::new(),
             collectables: HashMap::new(),
             last_error: None,
@@ -3802,6 +3861,77 @@ mod tests {
         let state = test_state(2, 2, vec![0, 0, 0, 0], vec![0, 0, 0, 0]);
 
         assert!(!is_tile_ready_to_harvest_at(&state, 1, 1, 1_000).unwrap());
+    }
+
+    #[test]
+    fn update_player_position_from_message_sets_world_and_map_coordinates() {
+        let mut position = PlayerPosition {
+            map_x: None,
+            map_y: None,
+            world_x: None,
+            world_y: None,
+        };
+
+        let changed = update_player_position_from_message(&doc! { "x": 20.8, "y": 14.88 }, &mut position);
+        let (expected_map_x, expected_map_y) = protocol::world_to_map(20.8, 14.88);
+
+        assert!(changed);
+        assert_eq!(position.world_x, Some(20.8));
+        assert_eq!(position.world_y, Some(14.88));
+        assert_eq!(position.map_x, Some(expected_map_x));
+        assert_eq!(position.map_y, Some(expected_map_y));
+    }
+
+    #[test]
+    fn update_player_position_from_message_reports_no_change_for_same_coordinates() {
+        let (map_x, map_y) = protocol::world_to_map(20.8, 14.88);
+        let mut position = PlayerPosition {
+            map_x: Some(map_x),
+            map_y: Some(map_y),
+            world_x: Some(20.8),
+            world_y: Some(14.88),
+        };
+
+        let changed = update_player_position_from_message(&doc! { "x": 20.8, "y": 14.88 }, &mut position);
+
+        assert!(!changed);
+    }
+
+    #[tokio::test]
+    async fn player_leave_removes_tracked_remote_player() {
+        let session = BotSession::new(
+            "test-session".to_string(),
+            crate::models::AuthInput::AndroidDevice {
+                device_id: Some("device".to_string()),
+            },
+            Logger::new(Arc::new(EventHub::new(16))),
+        )
+        .await;
+
+        {
+            let mut state = session.state.write().await;
+            state.user_id = Some("local-user".to_string());
+            state.other_players.insert(
+                "remote-user".to_string(),
+                PlayerPosition {
+                    map_x: Some(1.0),
+                    map_y: Some(2.0),
+                    world_x: Some(10.0),
+                    world_y: Some(20.0),
+                },
+            );
+        }
+
+        session
+            .remove_other_player(&doc! { "U": "remote-user" })
+            .await;
+
+        assert!(!session
+            .state
+            .read()
+            .await
+            .other_players
+            .contains_key("remote-user"));
     }
 }
 

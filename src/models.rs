@@ -72,6 +72,12 @@ pub struct PlayerPosition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePlayerSnapshot {
+    pub user_id: String,
+    pub position: PlayerPosition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinimapSnapshot {
     pub width: u32,
     pub height: u32,
@@ -80,6 +86,7 @@ pub struct MinimapSnapshot {
     pub water_tiles: Vec<u16>,
     pub wiring_tiles: Vec<u16>,
     pub player_position: PlayerPosition,
+    pub other_players: Vec<RemotePlayerSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
