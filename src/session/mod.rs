@@ -192,6 +192,23 @@ impl BotSession {
         Ok(format!("{action} queued for block {block_id}"))
     }
 
+    pub async fn punch(&self, offset_x: i32, offset_y: i32) -> Result<String, String> {
+        self.send_command(SessionCommand::Punch { offset_x, offset_y }).await?;
+        Ok(format!("punch queued at offset ({offset_x}, {offset_y})"))
+    }
+
+    pub async fn place(&self, offset_x: i32, offset_y: i32, block_id: i32) -> Result<String, String> {
+        self.send_command(SessionCommand::Place {
+            offset_x,
+            offset_y,
+            block_id,
+        })
+        .await?;
+        Ok(format!(
+            "place queued for block {block_id} at offset ({offset_x}, {offset_y})"
+        ))
+    }
+
     pub async fn move_direction(&self, direction: &str) -> Result<String, String> {
         let normalized = direction.trim().to_ascii_lowercase();
         if !matches!(normalized.as_str(), "left" | "right" | "up" | "down") {
@@ -430,6 +447,45 @@ impl BotSession {
                             protocol::make_unwear_item(block_id)
                         };
                         let _ = send_doc(&outbound_tx, packet).await;
+                    }
+                    SessionCommand::Punch { offset_x, offset_y } => {
+                        let Some(active) = &runtime else {
+                            self.set_error("connect the session before punching".to_string()).await;
+                            continue;
+                        };
+                        let outbound_tx = active.outbound_tx.clone();
+                        let state = self.state.clone();
+                        let logger = self.logger.clone();
+                        let session_id = self.id.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                manual_punch(&session_id, &logger, &state, &outbound_tx, offset_x, offset_y).await
+                            {
+                                logger.error("punch", Some(&session_id), error);
+                            }
+                        });
+                    }
+                    SessionCommand::Place {
+                        offset_x,
+                        offset_y,
+                        block_id,
+                    } => {
+                        let Some(active) = &runtime else {
+                            self.set_error("connect the session before placing blocks".to_string()).await;
+                            continue;
+                        };
+                        let outbound_tx = active.outbound_tx.clone();
+                        let state = self.state.clone();
+                        let logger = self.logger.clone();
+                        let session_id = self.id.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                manual_place(&session_id, &logger, &state, &outbound_tx, offset_x, offset_y, block_id)
+                                    .await
+                            {
+                                logger.error("place", Some(&session_id), error);
+                            }
+                        });
                     }
                     SessionCommand::StartFishing { direction, bait } => {
                         stop_background_worker(&mut fishing_stop_tx);
@@ -1154,6 +1210,8 @@ enum SessionCommand {
     AutomateTutorial,
     ManualMove { direction: String },
     WearItem { block_id: i32, equip: bool },
+    Punch { offset_x: i32, offset_y: i32 },
+    Place { offset_x: i32, offset_y: i32, block_id: i32 },
     StartFishing { direction: String, bait: String },
     StopFishing,
     Talk { message: String },
@@ -2450,6 +2508,63 @@ async fn manual_move(
     Ok(())
 }
 
+async fn manual_punch(
+    session_id: &str,
+    logger: &Logger,
+    state: &Arc<RwLock<SessionState>>,
+    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    offset_x: i32,
+    offset_y: i32,
+) -> Result<(), String> {
+    let (target_map_x, target_map_y, facing_direction) =
+        punch_target_from_offset(state, offset_x, offset_y).await?;
+    logger.info(
+        "punch",
+        Some(session_id),
+        format!(
+            "manual punch offset=({offset_x}, {offset_y}) -> target=({target_map_x}, {target_map_y})"
+        ),
+    );
+    send_docs(
+        outbound_tx,
+        vec![
+            movement_doc(state, movement::ANIM_PUNCH, facing_direction).await,
+            protocol::make_hit_block(target_map_x, target_map_y),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn manual_place(
+    session_id: &str,
+    logger: &Logger,
+    state: &Arc<RwLock<SessionState>>,
+    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    offset_x: i32,
+    offset_y: i32,
+    block_id: i32,
+) -> Result<(), String> {
+    let (target_map_x, target_map_y, facing_direction) =
+        punch_target_from_offset(state, offset_x, offset_y).await?;
+    logger.info(
+        "place",
+        Some(session_id),
+        format!(
+            "manual place block={block_id} offset=({offset_x}, {offset_y}) -> target=({target_map_x}, {target_map_y})"
+        ),
+    );
+    send_docs(
+        outbound_tx,
+        vec![
+            movement_doc(state, movement::ANIM_IDLE, facing_direction).await,
+            protocol::make_place_block(target_map_x, target_map_y, block_id),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn next_manual_step(
     state: &Arc<RwLock<SessionState>>,
     direction: &str,
@@ -2475,6 +2590,37 @@ async fn next_manual_step(
     };
 
     Ok((current_map_x + dx, current_map_y + dy, facing_direction))
+}
+
+async fn punch_target_from_offset(
+    state: &Arc<RwLock<SessionState>>,
+    offset_x: i32,
+    offset_y: i32,
+) -> Result<(i32, i32, i32), String> {
+    let state = state.read().await;
+    let current_map_x = state
+        .player_position
+        .map_x
+        .ok_or_else(|| "player map x is not known yet".to_string())?
+        .round() as i32;
+    let current_map_y = state
+        .player_position
+        .map_y
+        .ok_or_else(|| "player map y is not known yet".to_string())?
+        .round() as i32;
+    let facing_direction = if offset_x < 0 {
+        movement::DIR_LEFT
+    } else if offset_x > 0 {
+        movement::DIR_RIGHT
+    } else {
+        current_facing_direction(&state.player_position)
+    };
+
+    Ok((
+        current_map_x + offset_x,
+        current_map_y + offset_y,
+        facing_direction,
+    ))
 }
 
 fn current_facing_direction(position: &PlayerPosition) -> i32 {

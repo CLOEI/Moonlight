@@ -161,6 +161,19 @@ pub struct WearItemRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PunchRequest {
+    pub offset_x: i32,
+    pub offset_y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaceRequest {
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub block_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FishingStartRequest {
     pub direction: String,
     pub bait: String,

@@ -22,7 +22,7 @@ use crate::{
     logging::{Direction, EventHub, Logger, TransportKind},
     models::{
         ApiMessage, CreateSessionRequest, FishingStartRequest, JoinWorldRequest, MoveDirectionRequest,
-        ServerEvent, SpamStartRequest, TalkRequest, WearItemRequest,
+        PlaceRequest, PunchRequest, ServerEvent, SpamStartRequest, TalkRequest, WearItemRequest,
     },
     session::SessionManager,
 };
@@ -63,6 +63,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/leave", post(leave_world))
         .route("/api/sessions/{id}/disconnect", post(disconnect_session))
         .route("/api/sessions/{id}/move", post(move_session))
+        .route("/api/sessions/{id}/punch", post(punch_session))
+        .route("/api/sessions/{id}/place", post(place_session))
         .route("/api/sessions/{id}/wear", post(wear_item))
         .route("/api/sessions/{id}/tutorial/automate", post(automate_tutorial))
         .route("/api/sessions/{id}/fishing/start", post(start_fishing))
@@ -241,6 +243,46 @@ async fn wear_item(
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     let message = session
         .wear_item(request.block_id, request.equip)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({
+        "result": ApiMessage { ok: true, message },
+        "session": session.snapshot().await
+    })))
+}
+
+async fn punch_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PunchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .session_manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let message = session
+        .punch(request.offset_x, request.offset_y)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({
+        "result": ApiMessage { ok: true, message },
+        "session": session.snapshot().await
+    })))
+}
+
+async fn place_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PlaceRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .session_manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let message = session
+        .place(request.offset_x, request.offset_y, request.block_id)
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({
