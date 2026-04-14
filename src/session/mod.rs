@@ -589,6 +589,10 @@ impl BotSession {
         self.state.read().await.current_world.clone()
     }
 
+    pub(crate) async fn status(&self) -> SessionStatus {
+        self.state.read().await.status.clone()
+    }
+
     pub(crate) async fn is_in_world(&self) -> bool {
         self.state.read().await.status == SessionStatus::InWorld
     }

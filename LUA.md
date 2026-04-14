@@ -77,6 +77,7 @@ Notes:
 ```lua
 bot:getPosition()
 bot:getCurrentWorld()
+bot:getStatus()
 bot:isInWorld()
 bot:getInventoryCount(block_id)
 bot:getCollectables()
@@ -98,6 +99,8 @@ Return values:
 ```
 
 - `bot:getCurrentWorld()` returns the current world name or `nil`.
+- `bot:getStatus()` returns the current session status as one of:
+  `idle`, `connecting`, `authenticating`, `menu_ready`, `joining_world`, `loading_world`, `awaiting_ready`, `in_world`, `redirecting`, `disconnected`, or `error`.
 - `bot:isInWorld()` returns `true` or `false`.
 - `bot:getInventoryCount(block_id)` returns the summed amount for that block ID.
 - `bot:getCollectables()` returns a Lua array of:

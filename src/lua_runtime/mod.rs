@@ -286,6 +286,13 @@ fn build_bot_table(
             Ok(runtime.block_on(session.current_world()))
         })?
     })?;
+    bot.set("getStatus", {
+        let session = session.clone();
+        let runtime = runtime.clone();
+        lua.create_function(move |_lua, (_self,): (Value,)| {
+            Ok(runtime.block_on(session.status()).as_str())
+        })?
+    })?;
     bot.set("isInWorld", {
         let session = session.clone();
         let runtime = runtime.clone();

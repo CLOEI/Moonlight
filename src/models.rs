@@ -43,6 +43,24 @@ pub enum SessionStatus {
     Error,
 }
 
+impl SessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Connecting => "connecting",
+            Self::Authenticating => "authenticating",
+            Self::MenuReady => "menu_ready",
+            Self::JoiningWorld => "joining_world",
+            Self::LoadingWorld => "loading_world",
+            Self::AwaitingReady => "awaiting_ready",
+            Self::InWorld => "in_world",
+            Self::Redirecting => "redirecting",
+            Self::Disconnected => "disconnected",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileCount {
     pub tile_id: u16,
