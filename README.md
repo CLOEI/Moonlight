@@ -3,6 +3,8 @@
 
 <p align="center">World first PixelWorlds multibot</p>
 
+<p align="center"><a href="https://ko-fi.com/cloei"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support on Ko-fi"></a></p>
+
 <p align="center"><a href="https://discord.gg/a6FqT4G3dR">Discord link for communication</a></p>
 
 ## Overview
