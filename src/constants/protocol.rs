@@ -4,6 +4,7 @@ pub const PACKET_ID_ST: &str = "ST";
 pub const PACKET_ID_KEEPALIVE: &str = "p";
 pub const PACKET_ID_LEAVE_WORLD: &str = "LW";
 pub const PACKET_ID_JOIN_WORLD: &str = "TTjW";
+pub const PACKET_ID_WORLD_LOAD_ARGS: &str = "wlA";
 pub const PACKET_ID_GET_WORLD: &str = "Gw";
 pub const PACKET_ID_GET_WORLD_CONTENT: &str = "GWC";
 pub const PACKET_ID_UPDATE_LOCATION: &str = "ULS";

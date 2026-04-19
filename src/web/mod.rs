@@ -324,7 +324,7 @@ async fn join_world(
         .await
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     session
-        .join_world(request.world)
+        .join_world(request.world, request.instance)
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({

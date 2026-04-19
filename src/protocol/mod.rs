@@ -212,6 +212,23 @@ pub fn make_join_world(world: &str) -> Document {
     }
 }
 
+pub fn make_join_world_special(world: &str, biome: i32) -> Document {
+    doc! {
+        "ID": ids::PACKET_ID_JOIN_WORLD,
+        "Is": true,
+        "W": world.to_uppercase(),
+        "WB": biome,
+        "Amt": 0,
+    }
+}
+
+pub fn make_world_load_args(args: &[i32]) -> Document {
+    doc! {
+        "ID": ids::PACKET_ID_WORLD_LOAD_ARGS,
+        "WCSD": args.iter().copied().collect::<Vec<_>>(),
+    }
+}
+
 pub fn make_enter_world(world: &str) -> Vec<Document> {
     make_enter_world_eid(world, "")
 }
