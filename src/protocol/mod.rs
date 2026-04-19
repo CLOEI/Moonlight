@@ -296,6 +296,22 @@ pub fn make_hit_block(target_x: i32, target_y: i32) -> Document {
     }
 }
 
+pub fn make_hit_block_water(map_x: i32, map_y: i32) -> Document {
+    doc! {
+        "ID": ids::PACKET_ID_HIT_BLOCK_WATER,
+        "x": map_x,
+        "y": map_y,
+    }
+}
+
+pub fn make_hit_block_background(target_x: i32, target_y: i32) -> Document {
+    doc! {
+        "ID": ids::PACKET_ID_HIT_BLOCK_BG,
+        "x": target_x,
+        "y": target_y,
+    }
+}
+
 pub fn make_seed_block(target_x: i32, target_y: i32, block_id: i32) -> Document {
     doc! {
         "ID": ids::PACKET_ID_SEED_BLOCK,

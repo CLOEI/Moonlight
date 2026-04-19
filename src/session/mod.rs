@@ -3536,18 +3536,45 @@ async fn manual_punch(
 ) -> Result<(), String> {
     let (target_map_x, target_map_y, facing_direction) =
         punch_target_from_offset(state, offset_x, offset_y).await?;
+    let (fg, water, bg) = {
+        let state = state.read().await;
+        let snapshot = tile_snapshot_at(&state, target_map_x, target_map_y)
+            .unwrap_or(LuaTileSnapshot {
+                foreground: 0,
+                background: 0,
+                water: 0,
+                wiring: 0,
+                ready_to_harvest: false,
+            });
+        (snapshot.foreground, snapshot.water, snapshot.background)
+    };
+    let (layer, hit_doc) = if fg != 0 {
+        ("fg", protocol::make_hit_block(target_map_x, target_map_y))
+    } else if water != 0 {
+        (
+            "water",
+            protocol::make_hit_block_water(target_map_x, target_map_y),
+        )
+    } else if bg != 0 {
+        (
+            "bg",
+            protocol::make_hit_block_background(target_map_x, target_map_y),
+        )
+    } else {
+        ("fg", protocol::make_hit_block(target_map_x, target_map_y))
+    };
     logger.info(
         "punch",
         Some(session_id),
         format!(
-            "manual punch offset=({offset_x}, {offset_y}) -> target=({target_map_x}, {target_map_y})"
+            "manual punch offset=({offset_x}, {offset_y}) -> target=({target_map_x}, {target_map_y}) layer={layer}"
         ),
     );
     send_docs(
         outbound_tx,
         vec![
             movement_doc(state, movement::ANIM_PUNCH, facing_direction).await,
-            protocol::make_hit_block(target_map_x, target_map_y),
+            hit_doc,
         ],
     )
     .await?;
