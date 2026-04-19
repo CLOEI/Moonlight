@@ -111,10 +111,10 @@ export function listSessions() {
   return request<SessionsResponse>("/api/sessions")
 }
 
-export function joinWorld(sessionId: string, world: string) {
+export function joinWorld(sessionId: string, world: string, instance = false) {
   return request<ActionResponse>(`/api/sessions/${sessionId}/join`, {
     method: "POST",
-    body: JSON.stringify({ world }),
+    body: JSON.stringify({ world, instance }),
   })
 }
 

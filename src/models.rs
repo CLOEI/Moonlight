@@ -238,6 +238,8 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinWorldRequest {
     pub world: String,
+    #[serde(default)]
+    pub instance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

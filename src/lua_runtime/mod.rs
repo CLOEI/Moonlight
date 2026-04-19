@@ -132,6 +132,18 @@ fn build_bot_table(
         )?,
     )?;
     bot.set(
+        "warpInstance",
+        create_async_method(
+            lua,
+            session.clone(),
+            cancel.clone(),
+            runtime.clone(),
+            |session, cancel, runtime, (_, world): (Value, String)| {
+                runtime.block_on(session.warp_instance(&world, &cancel))
+            },
+        )?,
+    )?;
+    bot.set(
         "walk",
         create_async_method(
             lua,

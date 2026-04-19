@@ -48,6 +48,7 @@ Status fields:
 
 ```lua
 bot:warp(world)
+bot:warpInstance(world)
 bot:walk(dx, dy)
 bot:walkTo(x, y)
 bot:findPath(x, y)
@@ -64,6 +65,7 @@ bot:sendPacket(packet)
 Notes:
 
 - `warp(world)` joins the target world and waits until the session is fully in that world.
+- `warpInstance(world)` joins an instance/special world (e.g. `NETHERWORLD`). Sends `wlA` + `TTjW` with the `Is=true` flag. The server requires a consumable scroll in inventory.
 - `walk(dx, dy)` uses relative tile offsets from the current player tile.
 - `walkTo(x, y)` moves to an absolute map tile.
 - `findPath(x, y)` returns a Lua array of points like `{ { x = 10, y = 20 }, ... }`.

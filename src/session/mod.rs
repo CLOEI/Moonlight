@@ -146,6 +146,7 @@ impl BotSession {
             current_port: net::default_port(),
             current_world: None,
             pending_world: None,
+            pending_world_is_instance: false,
             username: None,
             user_id: None,
             world: None,
@@ -218,8 +219,8 @@ impl BotSession {
         self.send_command(SessionCommand::Connect).await
     }
 
-    pub async fn join_world(&self, world: String) -> Result<(), String> {
-        self.send_command(SessionCommand::JoinWorld(world)).await
+    pub async fn join_world(&self, world: String, instance: bool) -> Result<(), String> {
+        self.send_command(SessionCommand::JoinWorld { world, instance }).await
     }
 
     pub async fn leave_world(&self) -> Result<(), String> {
@@ -546,6 +547,23 @@ impl BotSession {
     }
 
     pub(crate) async fn warp(&self, world: &str, cancel: &AtomicBool) -> Result<(), String> {
+        self.warp_inner(world, false, cancel).await
+    }
+
+    pub(crate) async fn warp_instance(
+        &self,
+        world: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.warp_inner(world, true, cancel).await
+    }
+
+    async fn warp_inner(
+        &self,
+        world: &str,
+        instance: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
         ensure_not_cancelled(cancel)?;
         let world = world.trim().to_uppercase();
         if world.is_empty() {
@@ -565,6 +583,7 @@ impl BotSession {
             &self.controller_tx,
             &outbound_tx,
             &world,
+            instance,
             cancel,
         )
         .await
@@ -769,18 +788,30 @@ impl BotSession {
                             Err(error) => self.set_error(error).await,
                         }
                     }
-                    SessionCommand::JoinWorld(world) => {
+                    SessionCommand::JoinWorld { world, instance } => {
                         {
                             let mut state = self.state.write().await;
                             state.pending_world = Some(world.to_uppercase());
+                            state.pending_world_is_instance = instance;
                             state.status = SessionStatus::JoiningWorld;
                             state.other_players.clear();
                         }
                         self.publish_snapshot().await;
                         if let Some(active) = &runtime {
-                            let _ =
-                                send_doc(&active.outbound_tx, protocol::make_join_world(&world))
-                                    .await;
+                            if instance {
+                                let _ = send_docs(
+                                    &active.outbound_tx,
+                                    vec![
+                                        protocol::make_world_load_args(&[0]),
+                                        protocol::make_join_world_special(&world, 0),
+                                    ],
+                                )
+                                .await;
+                            } else {
+                                let _ =
+                                    send_doc(&active.outbound_tx, protocol::make_join_world(&world))
+                                        .await;
+                            }
                         }
                     }
                     SessionCommand::LeaveWorld => {
@@ -1396,12 +1427,15 @@ impl BotSession {
             }
             ids::PACKET_ID_REDIRECT => {
                 let redirect_host = message.get_str("IP").unwrap_or_default().to_string();
-                let fallback = {
+                let (fallback, is_instance) = {
                     let state = self.state.read().await;
-                    state
-                        .pending_world
-                        .clone()
-                        .or_else(|| state.current_world.clone())
+                    (
+                        state
+                            .pending_world
+                            .clone()
+                            .or_else(|| state.current_world.clone()),
+                        state.pending_world_is_instance,
+                    )
                 };
                 let world = message
                     .get_str("WN")
@@ -1417,7 +1451,18 @@ impl BotSession {
                         let mut state = self.state.write().await;
                         state.pending_world = Some(world.clone());
                     }
-                    let _ = send_doc(&runtime.outbound_tx, protocol::make_join_world(&world)).await;
+                    if is_instance {
+                        let _ = send_docs(
+                            &runtime.outbound_tx,
+                            vec![
+                                protocol::make_world_load_args(&[0]),
+                                protocol::make_join_world_special(&world, 0),
+                            ],
+                        )
+                        .await;
+                    } else {
+                        let _ = send_doc(&runtime.outbound_tx, protocol::make_join_world(&world)).await;
+                    }
                 }
             }
             ids::PACKET_ID_ALREADY_CONNECTED => {
@@ -1454,6 +1499,7 @@ impl BotSession {
             state.status = status;
             state.current_world = None;
             state.pending_world = None;
+            state.pending_world_is_instance = false;
             state.world = None;
             state.world_foreground_tiles.clear();
             state.world_background_tiles.clear();
@@ -1846,6 +1892,7 @@ struct SessionState {
     current_port: u16,
     current_world: Option<String>,
     pending_world: Option<String>,
+    pending_world_is_instance: bool,
     username: Option<String>,
     user_id: Option<String>,
     world: Option<WorldSnapshot>,
@@ -1869,7 +1916,7 @@ struct SessionState {
 #[derive(Debug)]
 enum SessionCommand {
     Connect,
-    JoinWorld(String),
+    JoinWorld { world: String, instance: bool },
     LeaveWorld,
     Disconnect,
     AutomateTutorial,
@@ -3244,6 +3291,7 @@ async fn ensure_world(
         controller_tx,
         outbound_tx,
         world,
+        false,
         &cancel,
     )
     .await
@@ -3256,6 +3304,7 @@ async fn ensure_world_cancellable(
     controller_tx: &mpsc::Sender<ControllerEvent>,
     outbound_tx: &mpsc::Sender<OutboundEnvelope>,
     world: &str,
+    instance: bool,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     ensure_not_cancelled(cancel)?;
@@ -3296,12 +3345,14 @@ async fn ensure_world_cancellable(
     } else {
         logger.state(
             Some(session_id),
-            format!("joining {world} for tutorial automation"),
+            format!("joining {world}{}",
+                if instance { " (instance)" } else { "" }),
         );
         controller_tx
-            .send(ControllerEvent::Command(SessionCommand::JoinWorld(
-                world.to_string(),
-            )))
+            .send(ControllerEvent::Command(SessionCommand::JoinWorld {
+                world: world.to_string(),
+                instance,
+            }))
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -3836,6 +3887,7 @@ mod tests {
             current_port: 0,
             current_world: Some("TEST".to_string()),
             pending_world: None,
+            pending_world_is_instance: false,
             username: None,
             user_id: None,
             world: Some(WorldSnapshot {
