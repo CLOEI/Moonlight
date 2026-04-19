@@ -1,4 +1,9 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -12,7 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -30,11 +35,29 @@ use crate::{
 };
 
 #[derive(Clone)]
+struct MovementCooldownState {
+    last_move_time: Option<Instant>,
+    blocked_attempt_count: u32,
+    blocked_attempts_reset_time: Option<Instant>,
+}
+
+impl MovementCooldownState {
+    fn new() -> Self {
+        Self {
+            last_move_time: None,
+            blocked_attempt_count: 0,
+            blocked_attempts_reset_time: None,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub session_manager: SessionManager,
     pub logger: Logger,
     pub event_hub: Arc<EventHub>,
     pub dashboard_auth: DashboardAuthManager,
+    pub movement_cooldowns: Arc<RwLock<HashMap<String, MovementCooldownState>>>,
 }
 
 impl AppState {
@@ -49,6 +72,7 @@ impl AppState {
             logger,
             event_hub,
             dashboard_auth,
+            movement_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -386,6 +410,37 @@ async fn move_session(
     Path(id): Path<String>,
     Json(request): Json<MoveDirectionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = Instant::now();
+    let mut cooldowns = state.movement_cooldowns.write().await;
+    let cooldown_state = cooldowns.entry(id.clone()).or_insert_with(MovementCooldownState::new);
+
+    if let Some(reset_time) = cooldown_state.blocked_attempts_reset_time {
+        if now.duration_since(reset_time) > Duration::from_secs(20) {
+            cooldown_state.blocked_attempt_count = 0;
+            cooldown_state.blocked_attempts_reset_time = None;
+        }
+    }
+
+    if cooldown_state.blocked_attempt_count >= 2 {
+        return Err(ApiError::bad_request(format!(
+            "too many blocked attempts recently ({})",
+            cooldown_state.blocked_attempt_count
+        )));
+    }
+
+    if let Some(last_time) = cooldown_state.last_move_time {
+        let elapsed = now.duration_since(last_time);
+        if elapsed < Duration::from_millis(1500) {
+            return Err(ApiError::bad_request(format!(
+                "movement cooldown active ({:?} elapsed)",
+                elapsed
+            )));
+        }
+    }
+
+    cooldown_state.last_move_time = Some(now);
+    drop(cooldowns);
+
     let session = state
         .session_manager
         .get_session(&id)
@@ -395,6 +450,17 @@ async fn move_session(
         .queue_move_direction(&request.direction)
         .await
         .map_err(ApiError::bad_request)?;
+
+    if message.contains("cannot move") {
+        let mut cooldowns = state.movement_cooldowns.write().await;
+        if let Some(cooldown_state) = cooldowns.get_mut(&id) {
+            cooldown_state.blocked_attempt_count += 1;
+            if cooldown_state.blocked_attempts_reset_time.is_none() {
+                cooldown_state.blocked_attempts_reset_time = Some(now);
+            }
+        }
+    }
+
     Ok(Json(json!({
         "result": ApiMessage { ok: true, message },
         "session": session.snapshot().await

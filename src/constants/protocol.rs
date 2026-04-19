@@ -51,3 +51,4 @@ pub const PACKET_ID_FISH_ON_AREA: &str = "FiOnAM";
 pub const PACKET_ID_FISH_OFF_AREA: &str = "FiOffAM";
 pub const PACKET_ID_FISH_RUN: &str = "FiRM";
 pub const PACKET_ID_FISHING_RESULT: &str = "MGC";
+pub const PACKET_ID_KICK_ERROR: &str = "KErr";

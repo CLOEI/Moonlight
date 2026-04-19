@@ -1469,6 +1469,11 @@ impl BotSession {
                 self.set_error("server reported Already Connected".to_string())
                     .await;
             }
+            ids::PACKET_ID_KICK_ERROR => {
+                let error_code = message.get_i32("ER").unwrap_or_default();
+                self.set_error(format!("kicked by server (code {error_code})"))
+                    .await;
+            }
             _ => {}
         }
         Ok(())
@@ -3547,6 +3552,34 @@ async fn manual_move(
     direction: &str,
 ) -> Result<(), String> {
     let (target_map_x, target_map_y, facing_direction) = next_manual_step(state, direction).await?;
+
+    let is_blocked = {
+        let state = state.read().await;
+        if let Some(world) = &state.world {
+            if let Some(index) = tile_index(world, target_map_x, target_map_y) {
+                if let Some(&tile_id) = state.world_foreground_tiles.get(index) {
+                    if !astar::is_walkable_tile(tile_id) {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+
+    if is_blocked {
+        return Err(format!(
+            "cannot move {direction} - tile ({target_map_x}, {target_map_y}) is solid"
+        ));
+    }
+
     let (world_x, world_y) = protocol::map_to_world(target_map_x as f64, target_map_y as f64);
     logger.info(
         "movement",
