@@ -1,3 +1,4 @@
+pub mod block_type;
 pub mod fishing;
 pub mod movement;
 pub mod network;

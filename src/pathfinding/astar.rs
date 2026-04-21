@@ -112,7 +112,7 @@ pub fn find_tile_path(
 }
 
 pub fn is_walkable_tile(tile_id: u16) -> bool {
-    tile_id == 0 || portal_tile_ids().contains(&tile_id)
+    walkable_tile_ids().contains(&tile_id)
 }
 
 fn tile_at(tiles: &[u16], width: usize, height: usize, x: i32, y: i32) -> Option<u16> {
@@ -171,23 +171,25 @@ fn reconstruct_path(
     path
 }
 
-fn portal_tile_ids() -> &'static std::collections::HashSet<u16> {
-    static PORTAL_TILE_IDS: OnceLock<std::collections::HashSet<u16>> = OnceLock::new();
-    PORTAL_TILE_IDS.get_or_init(load_portal_tile_ids)
+fn walkable_tile_ids() -> &'static std::collections::HashSet<u16> {
+    static WALKABLE_TILE_IDS: OnceLock<std::collections::HashSet<u16>> = OnceLock::new();
+    WALKABLE_TILE_IDS.get_or_init(load_walkable_tile_ids)
 }
 
-fn load_portal_tile_ids() -> std::collections::HashSet<u16> {
+fn load_walkable_tile_ids() -> std::collections::HashSet<u16> {
     let raw = include_str!("../../block_types.json");
-    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(raw) else {
+    let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else {
         return std::collections::HashSet::new();
     };
 
     entries
         .into_iter()
-        .filter_map(|(key, value)| {
-            let id = key.parse::<u16>().ok()?;
-            let name = value.as_str()?;
-            if name.contains("Portal") {
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_u64()? as u16;
+            let name = entry.get("name")?.as_str().unwrap_or("");
+            let block_type = entry.get("type")?.as_u64().unwrap_or(0) as u8;
+            // walkable: air tile, non-solid type, or portal regardless of type
+            if id == 0 || block_type != 0 || name.contains("Portal") {
                 Some(id)
             } else {
                 None
