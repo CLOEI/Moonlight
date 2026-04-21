@@ -29,11 +29,11 @@ function start() {
     if (module !== null) {
         console.log("[+] Found GameAssembly.dll at: " + module.base);
 
-        // dump.cs (2026-04-13)
-        // - OutgoingMessages.TurnMessagesToBytesAndConsumeThem()  RVA 0x96C300
-        // - AsynchronousClient.GetAndConsumeFirstPacketForClient() RVA 0x92EB80
-        const sendRVA = 0x96C300;
-        const receiveRVA = 0x92EB80;
+        // dump.cs (2026-04-20)
+        // - OutgoingMessages.TurnMessagesToBytesAndConsumeThem()  RVA 0x970CF0
+        // - AsynchronousClient.GetAndConsumeFirstPacketForClient() RVA 0x933470
+        const sendRVA = 0x970CF0;
+        const receiveRVA = 0x933470;
 
         // Hook SEND
         Interceptor.attach(module.base.add(sendRVA), {
