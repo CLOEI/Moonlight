@@ -157,6 +157,13 @@ export function wearItem(sessionId: string, blockId: number, equip: boolean) {
   })
 }
 
+export function dropItem(sessionId: string, blockId: number, inventoryType: number, amount: number) {
+  return request<ActionResponse>(`/api/sessions/${sessionId}/drop`, {
+    method: "POST",
+    body: JSON.stringify({ block_id: blockId, inventory_type: inventoryType, amount }),
+  })
+}
+
 export function getMinimap(sessionId: string) {
   return request<MinimapResponse>(`/api/sessions/${sessionId}/minimap?ts=${Date.now()}`)
 }

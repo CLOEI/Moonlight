@@ -27,7 +27,7 @@ use crate::{
     dashboard_auth::DashboardAuthManager,
     logging::{Direction, EventHub, Logger, TransportKind},
     models::{
-        ApiMessage, CreateSessionRequest, FishingStartRequest, JoinWorldRequest,
+        ApiMessage, CreateSessionRequest, DropItemRequest, FishingStartRequest, JoinWorldRequest,
         LuaScriptStartRequest, MoveDirectionRequest, PlaceRequest, PunchRequest, ServerEvent,
         SpamStartRequest, TalkRequest, WearItemRequest,
     },
@@ -100,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/punch", post(punch_session))
         .route("/api/sessions/{id}/place", post(place_session))
         .route("/api/sessions/{id}/wear", post(wear_item))
+        .route("/api/sessions/{id}/drop", post(drop_item))
         .route(
             "/api/sessions/{id}/tutorial/automate",
             post(automate_tutorial),
@@ -479,6 +480,26 @@ async fn wear_item(
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     let message = session
         .queue_wear_item(request.block_id, request.equip)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({
+        "result": ApiMessage { ok: true, message },
+        "session": session.snapshot().await
+    })))
+}
+
+async fn drop_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<DropItemRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .session_manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let message = session
+        .queue_drop_item(request.block_id, request.inventory_type, request.amount)
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({

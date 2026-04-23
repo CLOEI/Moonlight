@@ -557,6 +557,30 @@ pub fn make_fish_off_area(distance: f64) -> Document {
     }
 }
 
+pub fn make_drop_item(
+    tile_x: i32,
+    tile_y: i32,
+    block_type: i32,
+    inventory_type: i32,
+    amount: i32,
+) -> Document {
+    doc! {
+        "ID": ids::PACKET_ID_DROP_ITEM,
+        "x": tile_x,
+        "y": tile_y,
+        "dI": {
+            "CollectableID": 0i32,
+            "BlockType": block_type,
+            "Amount": amount,
+            "InventoryType": inventory_type >> 8,
+            "PosX": 0.0f64,
+            "PosY": 0.0f64,
+            "IsGem": false,
+            "GemType": 0i32,
+        },
+    }
+}
+
 pub fn make_world_chat(message: &str) -> Document {
     doc! {
         "ID": ids::PACKET_ID_WORLD_CHAT,

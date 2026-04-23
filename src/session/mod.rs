@@ -276,6 +276,24 @@ impl BotSession {
         is_tile_ready_to_harvest_at(&state, map_x, map_y, protocol::csharp_ticks())
     }
 
+    pub async fn queue_drop_item(
+        &self,
+        block_id: i32,
+        inventory_type: i32,
+        amount: i32,
+    ) -> Result<String, String> {
+        if amount <= 0 {
+            return Err("amount must be greater than 0".to_string());
+        }
+        self.send_command(SessionCommand::DropItem {
+            block_id,
+            inventory_type,
+            amount,
+        })
+        .await?;
+        Ok(format!("drop queued: {amount}x block {block_id}"))
+    }
+
     pub async fn queue_wear_item(&self, block_id: i32, equip: bool) -> Result<String, String> {
         self.send_command(SessionCommand::WearItem { block_id, equip })
             .await?;
@@ -1071,6 +1089,40 @@ impl BotSession {
                     }
                     SessionCommand::StopSpam => {
                         stop_background_worker(&mut spam_stop_tx);
+                    }
+                    SessionCommand::DropItem {
+                        block_id,
+                        inventory_type,
+                        amount,
+                    } => {
+                        let Some(active) = &runtime else {
+                            self.set_error("connect the session before dropping items".to_string())
+                                .await;
+                            continue;
+                        };
+                        let outbound_tx = active.outbound_tx.clone();
+                        let (tile_x, tile_y) = {
+                            let state = self.state.read().await;
+                            let pos = &state.player_position;
+                            (
+                                pos.map_x.unwrap_or(0.0).round() as i32,
+                                pos.map_y.unwrap_or(0.0).round() as i32,
+                            )
+                        };
+                        let _ = send_docs(
+                            &outbound_tx,
+                            vec![
+                                protocol::make_drop_item(
+                                    tile_x,
+                                    tile_y,
+                                    block_id,
+                                    inventory_type,
+                                    amount,
+                                ),
+                                protocol::make_progress_signal(0),
+                            ],
+                        )
+                        .await;
                     }
                 },
                 ControllerEvent::Inbound(runtime_id, message) => {
@@ -2058,6 +2110,11 @@ enum SessionCommand {
         delay_ms: u64,
     },
     StopSpam,
+    DropItem {
+        block_id: i32,
+        inventory_type: i32,
+        amount: i32,
+    },
 }
 
 #[derive(Debug)]

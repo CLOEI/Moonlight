@@ -67,6 +67,7 @@ import {
   stopSpam,
   talk,
   wearItem,
+  dropItem,
   type ActionResponse,
 } from "@/lib/api"
 import {
@@ -262,6 +263,7 @@ function App() {
     {},
   )
   const [hoverTiles, setHoverTiles] = useState<Record<string, string>>({})
+  const [dropAmounts, setDropAmounts] = useState<Record<string, string>>({})
   const [logs, setLogs] = useState<LogEvent[]>([])
   const [blockNames, setBlockNames] = useState<BlockNameMap>({})
   const [feedback, setFeedback] = useState<Feedback | null>(null)
@@ -1016,6 +1018,33 @@ function App() {
                                           </Button>
                                         </div>
                                       ) : null}
+                                      <div className="flex gap-1">
+                                        <Input
+                                          className="h-6 min-w-0 flex-1 rounded-lg border-white/10 bg-white/5 px-1.5 text-center text-xs"
+                                          type="number"
+                                          min={1}
+                                          max={item.amount}
+                                          value={dropAmounts[`${session.id}-${item.block_id}-${item.inventory_type}`] ?? "1"}
+                                          onChange={(e) => {
+                                            const key = `${session.id}-${item.block_id}-${item.inventory_type}`
+                                            setDropAmounts((prev) => ({ ...prev, [key]: e.target.value }))
+                                          }}
+                                        />
+                                        <Button
+                                          size="xs"
+                                          variant="outline"
+                                          className="rounded-lg border-white/10 bg-white/5"
+                                          onClick={() => {
+                                            const key = `${session.id}-${item.block_id}-${item.inventory_type}`
+                                            const amt = Math.max(1, Math.min(item.amount, parseInt(dropAmounts[key] ?? "1", 10) || 1))
+                                            void runAction(() =>
+                                              dropItem(session.id, item.block_id, item.inventory_type, amt),
+                                            )
+                                          }}
+                                        >
+                                          Drop
+                                        </Button>
+                                      </div>
                                     </div>
                                   )
                                 })
