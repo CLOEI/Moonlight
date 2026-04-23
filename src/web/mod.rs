@@ -499,7 +499,7 @@ async fn drop_item(
         .await
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     let message = session
-        .queue_drop_item(request.block_id, request.inventory_type, request.amount)
+        .queue_drop_item(request.block_id, request.amount)
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({

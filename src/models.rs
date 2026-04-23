@@ -292,7 +292,6 @@ pub struct LuaScriptStartRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DropItemRequest {
     pub block_id: i32,
-    pub inventory_type: i32,
     pub amount: i32,
 }
 

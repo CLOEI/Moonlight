@@ -235,13 +235,13 @@ pub fn make_enter_world_eid(world: &str, eid: &str) -> Vec<Document> {
 }
 
 pub fn make_spawn_location_sync(world: &str) -> Vec<Document> {
-    vec![make_update_location(world), make_st()]
+    vec![make_update_location(world)]
 }
 
 pub fn make_spawn_setup() -> Vec<Document> {
     vec![
         doc! { "ID": "cZL", "CZL": 2 },
-        doc! { "ID": "cZva", "Amt": 0.5 },
+        doc! { "ID": "cZva", "Amt": 1.0 },
         doc! { "ID": ids::PACKET_ID_R_OP },
         doc! { "ID": "rAIp" },
         doc! { "ID": ids::PACKET_ID_R_AI },
@@ -249,7 +249,7 @@ pub fn make_spawn_setup() -> Vec<Document> {
 }
 
 pub fn make_ready_to_play() -> Vec<Document> {
-    vec![doc! { "ID": ids::PACKET_ID_READY_TO_PLAY }, make_st()]
+    vec![doc! { "ID": ids::PACKET_ID_READY_TO_PLAY }]
 }
 
 pub fn make_leave_world() -> Document {
@@ -485,7 +485,7 @@ pub fn make_spawn_packets(map_x: i32, map_y: i32, world_x: f64, world_y: f64) ->
             world_x,
             world_y,
             movement::ANIM_IDLE,
-            movement::DIR_RIGHT,
+            movement::DIR_LEFT,
             true,
         ),
     ]
@@ -572,7 +572,7 @@ pub fn make_drop_item(
             "CollectableID": 0i32,
             "BlockType": block_type,
             "Amount": amount,
-            "InventoryType": inventory_type >> 8,
+            "InventoryType": inventory_type,
             "PosX": 0.0f64,
             "PosY": 0.0f64,
             "IsGem": false,

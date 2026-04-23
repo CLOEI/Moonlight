@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{
     Arc, OnceLock,
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use bson::Document;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{RwLock, mpsc, watch};
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{MissedTickBehavior, interval, interval_at, sleep, sleep_until};
 
 use crate::auth;
 use crate::constants::{fishing, movement, network, protocol as ids, timing, tutorial};
@@ -30,7 +30,17 @@ use crate::world;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static RUNTIME_COUNTER: AtomicU64 = AtomicU64::new(1);
-static BLOCK_NAMES: OnceLock<HashMap<u16, String>> = OnceLock::new();
+static BLOCK_TYPES: OnceLock<HashMap<u16, BlockTypeInfo>> = OnceLock::new();
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BlockTypeInfo {
+    id: u16,
+    name: String,
+    #[serde(rename = "type")]
+    inventory_type: u16,
+    #[serde(rename = "typeName")]
+    type_name: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
@@ -279,15 +289,22 @@ impl BotSession {
     pub async fn queue_drop_item(
         &self,
         block_id: i32,
-        inventory_type: i32,
         amount: i32,
     ) -> Result<String, String> {
         if amount <= 0 {
             return Err("amount must be greater than 0".to_string());
         }
+        if let Some(type_name) = block_type_name_for(block_id as u16) {
+            if type_name == "WearableItem" {
+                let name = block_name_for(block_id as u16)
+                    .unwrap_or_else(|| format!("block {block_id}"));
+                return Err(format!(
+                    "{name} is a {type_name}; server rejects dropping this category"
+                ));
+            }
+        }
         self.send_command(SessionCommand::DropItem {
             block_id,
-            inventory_type,
             amount,
         })
         .await?;
@@ -819,7 +836,7 @@ impl BotSession {
                         self.publish_snapshot().await;
                         if let Some(active) = &runtime {
                             if instance {
-                                let _ = send_docs(
+                                let _ = send_docs_exclusive(
                                     &active.outbound_tx,
                                     vec![
                                         protocol::make_world_load_args(&[0]),
@@ -842,7 +859,9 @@ impl BotSession {
                                 send_doc(&active.outbound_tx, protocol::make_leave_world()).await;
                             let _ = send_scheduler_cmd(
                                 &active.outbound_tx,
-                                SchedulerCommand::LeaveWorld,
+                                SchedulerCommand::SetPhase {
+                                    phase: SchedulerPhase::MenuIdle,
+                                },
                             )
                             .await;
                         }
@@ -1092,7 +1111,6 @@ impl BotSession {
                     }
                     SessionCommand::DropItem {
                         block_id,
-                        inventory_type,
                         amount,
                     } => {
                         let Some(active) = &runtime else {
@@ -1101,17 +1119,36 @@ impl BotSession {
                             continue;
                         };
                         let outbound_tx = active.outbound_tx.clone();
-                        let (tile_x, tile_y) = {
+                        let (tile_x, tile_y, inventory_type) = {
                             let state = self.state.read().await;
                             let pos = &state.player_position;
-                            (
-                                pos.map_x.unwrap_or(0.0).round() as i32,
-                                pos.map_y.unwrap_or(0.0).round() as i32,
-                            )
+                            let inventory_type = block_inventory_type_for(block_id as u16)
+                                .map(i32::from)
+                                .or_else(|| {
+                                    state
+                                        .inventory
+                                        .iter()
+                                        .find(|entry| {
+                                            entry.block_id == block_id as u16 && entry.amount > 0
+                                        })
+                                        .map(|entry| entry.inventory_type as i32)
+                                })
+                                .unwrap_or_default();
+                            if let (Some(world_x), Some(world_y)) = (pos.world_x, pos.world_y) {
+                                let (map_x, map_y) = protocol::world_to_map(world_x, world_y);
+                                (map_x.floor() as i32, map_y.floor() as i32 + 1, inventory_type)
+                            } else {
+                                (
+                                    pos.map_x.unwrap_or(0.0).floor() as i32,
+                                    pos.map_y.unwrap_or(0.0).floor() as i32 + 1,
+                                    inventory_type,
+                                )
+                            }
                         };
-                        let _ = send_docs(
+                        let _ = send_docs_immediate(
                             &outbound_tx,
                             vec![
+                                protocol::make_empty_movement(),
                                 protocol::make_drop_item(
                                     tile_x,
                                     tile_y,
@@ -1415,9 +1452,11 @@ impl BotSession {
                     }
                     self.publish_snapshot().await;
                     if let Some(world) = world {
-                        for item in protocol::make_enter_world(&world) {
-                            let _ = send_doc(&runtime.outbound_tx, item).await;
-                        }
+                        let _ = send_docs_exclusive(
+                            &runtime.outbound_tx,
+                            protocol::make_enter_world(&world),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1447,12 +1486,13 @@ impl BotSession {
                 self.publish_snapshot().await;
 
                 if let Some(world) = world_name {
-                    for item in protocol::make_spawn_location_sync(&world) {
-                        let _ = send_doc(&runtime.outbound_tx, item).await;
-                    }
-                    for item in protocol::make_spawn_setup() {
-                        let _ = send_doc(&runtime.outbound_tx, item).await;
-                    }
+                    let _ = send_docs_exclusive(
+                        &runtime.outbound_tx,
+                        protocol::make_spawn_location_sync(&world),
+                    )
+                    .await;
+                    let _ = send_docs_exclusive(&runtime.outbound_tx, protocol::make_spawn_setup())
+                        .await;
                 }
             }
             ids::PACKET_ID_R_OP => {
@@ -1461,9 +1501,11 @@ impl BotSession {
             ids::PACKET_ID_R_AI => {
                 let should_ready = self.state.read().await.awaiting_ready;
                 if should_ready {
-                    for item in protocol::make_ready_to_play() {
-                        let _ = send_doc(&runtime.outbound_tx, item).await;
-                    }
+                    let _ =
+                        send_docs_exclusive(&runtime.outbound_tx, protocol::make_ready_to_play())
+                            .await;
+
+                    sleep(Duration::from_millis(1000)).await;
 
                     if let Some(world) = self.state.read().await.world.clone() {
                         if let (Some(map_x), Some(map_y), Some(world_x), Some(world_y)) = (
@@ -1472,14 +1514,16 @@ impl BotSession {
                             world.spawn_world_x,
                             world.spawn_world_y,
                         ) {
-                            for item in protocol::make_spawn_packets(
+                            let _ = send_docs_exclusive(
+                                &runtime.outbound_tx,
+                                protocol::make_spawn_packets(
                                 map_x.round() as i32,
                                 map_y.round() as i32,
                                 world_x,
                                 world_y,
-                            ) {
-                                let _ = send_doc(&runtime.outbound_tx, item).await;
-                            }
+                                ),
+                            )
+                            .await;
                         }
                     }
 
@@ -1490,7 +1534,9 @@ impl BotSession {
                     }
                     let _ = send_scheduler_cmd(
                         &runtime.outbound_tx,
-                        SchedulerCommand::EnterWorld,
+                        SchedulerCommand::SetPhase {
+                            phase: SchedulerPhase::WorldIdle,
+                        },
                     )
                     .await;
                     self.publish_snapshot().await;
@@ -1523,7 +1569,7 @@ impl BotSession {
                         state.pending_world = Some(world.clone());
                     }
                     if is_instance {
-                        let _ = send_docs(
+                        let _ = send_docs_exclusive(
                             &runtime.outbound_tx,
                             vec![
                                 protocol::make_world_load_args(&[0]),
@@ -1801,7 +1847,7 @@ impl BotSession {
     async fn apply_fishing_message(
         &self,
         message: &Document,
-        outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+        outbound_tx: &OutboundHandle,
     ) {
         let minigame_type = message.get_i32("MGT").unwrap_or_default();
         if minigame_type != 2 {
@@ -1865,30 +1911,54 @@ fn update_player_position_from_message(message: &Document, position: &mut Player
 #[derive(Debug)]
 struct ActiveRuntime {
     id: u64,
-    outbound_tx: mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: OutboundHandle,
     stop_tx: watch::Sender<bool>,
 }
 
-#[derive(Debug)]
-enum OutboundEnvelope {
-    Single(Document),
-    Batch(Vec<Document>),
-    Control(SchedulerCommand),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendMode {
+    Mergeable,
+    ExclusiveBatch,
+    ImmediateExclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePriority {
+    BeforeGenerated,
+    AfterGenerated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerPhase {
+    Disconnected,
+    MenuIdle,
+    MenuStBurst,
+    WorldIdle,
+    WorldMoving,
 }
 
 #[derive(Debug)]
 enum SchedulerCommand {
-    SetMovement {
+    EnqueuePackets {
+        docs: Vec<Document>,
+        mode: SendMode,
+        priority: QueuePriority,
+    },
+    UpdateMovement {
         world_x: f64,
         world_y: f64,
         is_moving: bool,
         anim: i32,
         direction: i32,
     },
-    EnterWorld,
-    LeaveWorld,
+    SetPhase {
+        phase: SchedulerPhase,
+    },
     StResponseReceived,
+    Shutdown,
 }
+
+type OutboundHandle = mpsc::Sender<SchedulerCommand>;
 
 #[derive(Debug, Clone)]
 struct MovementTickState {
@@ -1911,6 +1981,15 @@ impl Default for MovementTickState {
             direction: movement::DIR_RIGHT,
         }
     }
+}
+
+#[derive(Debug)]
+enum PendingBatch {
+    Mergeable {
+        docs: Vec<Document>,
+        priority: QueuePriority,
+    },
+    Exclusive(Vec<Document>),
 }
 
 struct StSyncState {
@@ -1957,6 +2036,249 @@ impl StSyncState {
             }
         }
     }
+}
+
+struct SchedulerState {
+    phase: SchedulerPhase,
+    movement: MovementTickState,
+    st_sync: StSyncState,
+    pending: VecDeque<PendingBatch>,
+    immediate: VecDeque<Vec<Document>>,
+    menu_keepalive_due: bool,
+    st_due: bool,
+}
+
+impl SchedulerState {
+    fn new() -> Self {
+        Self {
+            phase: SchedulerPhase::MenuStBurst,
+            movement: MovementTickState::default(),
+            st_sync: StSyncState::new(),
+            pending: VecDeque::new(),
+            immediate: VecDeque::new(),
+            menu_keepalive_due: false,
+            st_due: true,
+        }
+    }
+
+    fn has_immediate_batch(&self) -> bool {
+        !self.immediate.is_empty()
+    }
+
+    fn is_menu_phase(&self) -> bool {
+        matches!(
+            self.phase,
+            SchedulerPhase::MenuIdle | SchedulerPhase::MenuStBurst
+        )
+    }
+
+    fn enqueue_packets(&mut self, docs: Vec<Document>, mode: SendMode, priority: QueuePriority) {
+        if docs.is_empty() {
+            return;
+        }
+        match mode {
+            SendMode::ImmediateExclusive => self.immediate.push_back(docs),
+            SendMode::ExclusiveBatch => self.pending.push_back(PendingBatch::Exclusive(docs)),
+            SendMode::Mergeable => match self.pending.back_mut() {
+                Some(PendingBatch::Mergeable {
+                    docs: queued,
+                    priority: queued_priority,
+                }) if *queued_priority == priority => queued.extend(docs),
+                _ => self
+                    .pending
+                    .push_back(PendingBatch::Mergeable { docs, priority }),
+            },
+        }
+    }
+
+    fn update_movement(
+        &mut self,
+        world_x: f64,
+        world_y: f64,
+        is_moving: bool,
+        anim: i32,
+        direction: i32,
+    ) {
+        self.movement.world_x = world_x;
+        self.movement.world_y = world_y;
+        self.movement.is_moving = is_moving;
+        self.movement.anim = anim;
+        self.movement.direction = direction;
+        if matches!(
+            self.phase,
+            SchedulerPhase::WorldIdle | SchedulerPhase::WorldMoving
+        ) {
+            self.phase = if is_moving {
+                SchedulerPhase::WorldMoving
+            } else {
+                SchedulerPhase::WorldIdle
+            };
+        }
+    }
+
+    fn set_phase(&mut self, phase: SchedulerPhase) {
+        self.phase = match phase {
+            SchedulerPhase::WorldIdle | SchedulerPhase::WorldMoving => {
+                self.movement.in_world = true;
+                if self.movement.is_moving {
+                    SchedulerPhase::WorldMoving
+                } else {
+                    SchedulerPhase::WorldIdle
+                }
+            }
+            SchedulerPhase::MenuIdle | SchedulerPhase::MenuStBurst => {
+                self.movement.in_world = false;
+                self.movement.is_moving = false;
+                self.menu_keepalive_due = false;
+                phase
+            }
+            SchedulerPhase::Disconnected => {
+                self.movement.in_world = false;
+                self.movement.is_moving = false;
+                SchedulerPhase::Disconnected
+            }
+        };
+    }
+
+    fn mark_menu_keepalive_due(&mut self) {
+        if self.is_menu_phase() {
+            self.menu_keepalive_due = true;
+        }
+    }
+
+    fn mark_st_due(&mut self) {
+        self.st_due = true;
+    }
+
+    fn take_immediate_batch(&mut self) -> Option<Vec<Document>> {
+        self.immediate.pop_front()
+    }
+
+    fn take_slot_batch(&mut self) -> Option<Vec<Document>> {
+        if let Some(PendingBatch::Exclusive(_)) = self.pending.front() {
+            if let Some(PendingBatch::Exclusive(docs)) = self.pending.pop_front() {
+                return Some(docs);
+            }
+        }
+
+        let mut before_generated = Vec::new();
+        let mut after_generated = Vec::new();
+        while let Some(PendingBatch::Mergeable { .. }) = self.pending.front() {
+            if let Some(PendingBatch::Mergeable { docs, priority }) = self.pending.pop_front() {
+                match priority {
+                    QueuePriority::BeforeGenerated => before_generated.extend(docs),
+                    QueuePriority::AfterGenerated => after_generated.extend(docs),
+                }
+            }
+        }
+
+        let mut batch = before_generated;
+        match self.phase {
+            SchedulerPhase::Disconnected => {
+                if batch.is_empty() && after_generated.is_empty() {
+                    return None;
+                }
+            }
+            SchedulerPhase::MenuIdle => {
+                batch.extend(after_generated);
+                if self.menu_keepalive_due {
+                    batch.push(protocol::make_keepalive());
+                    self.menu_keepalive_due = false;
+                }
+                if self.st_due {
+                    batch.push(protocol::make_st());
+                    self.st_due = false;
+                }
+                if batch.is_empty() {
+                    return Some(Vec::new());
+                }
+            }
+            SchedulerPhase::MenuStBurst => {
+                batch.extend(after_generated);
+                if self.menu_keepalive_due {
+                    batch.push(protocol::make_keepalive());
+                    self.menu_keepalive_due = false;
+                }
+                if self.st_due {
+                    batch.push(protocol::make_st());
+                    self.st_due = false;
+                }
+                if batch.is_empty() {
+                    return None;
+                }
+            }
+            SchedulerPhase::WorldIdle => {
+                batch.push(protocol::make_empty_movement());
+                batch.extend(after_generated);
+                if self.st_due {
+                    batch.push(protocol::make_st());
+                    self.st_due = false;
+                }
+            }
+            SchedulerPhase::WorldMoving => {
+                batch.push(protocol::make_movement_packet(
+                    self.movement.world_x,
+                    self.movement.world_y,
+                    self.movement.anim,
+                    self.movement.direction,
+                    false,
+                ));
+                batch.extend(after_generated);
+                if self.st_due {
+                    batch.push(protocol::make_st());
+                    self.st_due = false;
+                }
+            }
+        }
+
+        Some(batch)
+    }
+
+    fn on_batch_sent(&mut self, batch: &[Document]) -> bool {
+        let sent_st = batch.iter().any(|doc| packet_id(doc) == ids::PACKET_ID_ST);
+        if sent_st {
+            self.st_sync.last_sent_at = Some(std::time::Instant::now());
+        }
+        sent_st
+    }
+
+    fn handle_st_response(&mut self) -> Option<Duration> {
+        let sent_at = self.st_sync.last_sent_at.take()?;
+        let rtt_ms = sent_at.elapsed().as_millis() as i32;
+        self.st_sync.record_sample(rtt_ms);
+        if self.st_sync.sample_count < timing::ST_SAMPLE_COUNT {
+            self.st_due = true;
+            if self.phase == SchedulerPhase::MenuIdle {
+                self.phase = SchedulerPhase::MenuStBurst;
+            }
+            None
+        } else {
+            if self.phase == SchedulerPhase::MenuStBurst {
+                self.phase = SchedulerPhase::MenuIdle;
+            }
+            Some(Duration::from_secs(self.st_sync.interval_secs as u64))
+        }
+    }
+}
+
+fn packet_id(doc: &Document) -> &str {
+    doc.get_str("ID").unwrap_or_default()
+}
+
+async fn write_logged_batch(
+    writer: &mut OwnedWriteHalf,
+    logger: &Logger,
+    session_id: &str,
+    batch: &[Document],
+) -> Result<(), String> {
+    logger.transport(
+        TransportKind::Tcp,
+        Direction::Outgoing,
+        "tcp",
+        Some(session_id),
+        protocol::log_batch(batch),
+    );
+    protocol::write_batch(writer, batch).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2060,7 +2382,7 @@ struct SessionState {
     world_background_tiles: Vec<u16>,
     world_water_tiles: Vec<u16>,
     world_wiring_tiles: Vec<u16>,
-    current_outbound_tx: Option<mpsc::Sender<OutboundEnvelope>>,
+    current_outbound_tx: Option<OutboundHandle>,
     growing_tiles: HashMap<(i32, i32), GrowingTileState>,
     player_position: PlayerPosition,
     other_players: HashMap<String, PlayerPosition>,
@@ -2112,7 +2434,6 @@ enum SessionCommand {
     StopSpam,
     DropItem {
         block_id: i32,
-        inventory_type: i32,
         amount: i32,
     },
 }
@@ -2329,14 +2650,33 @@ fn summarize_tile_counts(tiles: &[u16]) -> Vec<TileCount> {
         .collect()
 }
 
-fn block_names() -> &'static HashMap<u16, String> {
-    BLOCK_NAMES.get_or_init(|| {
-        serde_json::from_str::<HashMap<String, String>>(include_str!("../../block_types.json"))
+fn block_types() -> &'static HashMap<u16, BlockTypeInfo> {
+    BLOCK_TYPES.get_or_init(|| {
+        serde_json::from_str::<Vec<BlockTypeInfo>>(include_str!("../../block_types.json"))
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(key, value)| key.parse::<u16>().ok().map(|id| (id, value)))
+            .map(|entry| (entry.id, entry))
             .collect()
     })
+}
+
+fn block_names() -> HashMap<u16, String> {
+    block_types()
+        .iter()
+        .map(|(id, entry)| (*id, entry.name.clone()))
+        .collect()
+}
+
+fn block_inventory_type_for(block_id: u16) -> Option<u16> {
+    block_types().get(&block_id).map(|entry| entry.inventory_type)
+}
+
+fn block_name_for(block_id: u16) -> Option<String> {
+    block_types().get(&block_id).map(|entry| entry.name.clone())
+}
+
+fn block_type_name_for(block_id: u16) -> Option<String> {
+    block_types().get(&block_id).map(|entry| entry.type_name.clone())
 }
 
 fn normalize_block_name(name: &str) -> String {
@@ -2363,10 +2703,7 @@ fn find_inventory_bait(
             return Ok(NamedInventoryEntry {
                 inventory_key: item.inventory_key,
                 block_id: item.block_id,
-                name: block_names()
-                    .get(&item.block_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("#{}", item.block_id)),
+                name: block_name_for(item.block_id).unwrap_or_else(|| format!("#{}", item.block_id)),
             });
         }
     }
@@ -2376,7 +2713,7 @@ fn find_inventory_bait(
         .iter()
         .filter(|item| item.amount > 0)
         .find_map(|item| {
-            let name = block_names().get(&item.block_id)?.clone();
+            let name = block_name_for(item.block_id)?;
             (normalize_block_name(&name) == normalized_query).then_some(NamedInventoryEntry {
                 inventory_key: item.inventory_key,
                 block_id: item.block_id,
@@ -2430,7 +2767,7 @@ fn initialize_fishing_gauge(fishing: &mut FishingAutomationState, now: Instant) 
     let rod_block = fishing.rod_block.unwrap_or(2406);
     let fish_name = fishing
         .fish_block
-        .and_then(|id| block_names().get(&(id as u16)).cloned())
+        .and_then(|id| block_name_for(id as u16))
         .unwrap_or_default();
     let normalized = normalize_block_name(&fish_name);
     let bucket = fishing::fish_bucket_from_name(&normalized);
@@ -2620,7 +2957,7 @@ fn service_fishing_simulation(
 async fn spam_loop(
     session_id: &str,
     logger: &Logger,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     mut stop_rx: watch::Receiver<bool>,
     message: String,
     delay_ms: u64,
@@ -2647,10 +2984,10 @@ async fn spam_loop(
 async fn send_world_chat(
     _session_id: &str,
     _logger: &Logger,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     message: &str,
 ) -> Result<(), String> {
-    send_docs(
+    send_docs_exclusive(
         outbound_tx,
         vec![
             protocol::make_empty_movement(),
@@ -2665,7 +3002,7 @@ async fn fishing_loop(
     session_id: &str,
     logger: &Logger,
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     mut stop_rx: watch::Receiver<bool>,
     target: FishingTarget,
 ) -> Result<(), String> {
@@ -2713,7 +3050,7 @@ async fn fishing_loop(
             ),
         );
 
-        send_docs(
+        send_docs_exclusive(
             outbound_tx,
             vec![
                 protocol::make_select_belt_item(bait.inventory_key),
@@ -2763,7 +3100,7 @@ async fn fishing_loop(
                 let mut session = state.write().await;
                 session.fishing.hook_sent = true;
             }
-            send_docs(outbound_tx, vec![protocol::make_fishing_hook_action()]).await?;
+            send_docs_exclusive(outbound_tx, vec![protocol::make_fishing_hook_action()]).await?;
         }
 
         let mut gauge_tick = interval(Duration::from_millis(50));
@@ -2829,13 +3166,13 @@ async fn consume_fishing_bait(
 
 async fn stop_fishing_game(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
 ) -> Result<(), String> {
     {
         let mut session = state.write().await;
         session.fishing = FishingAutomationState::default();
     }
-    send_docs(
+    send_docs_exclusive(
         outbound_tx,
         vec![
             protocol::make_fishing_cleanup_action(),
@@ -2886,32 +3223,41 @@ async fn read_loop(
 
 async fn scheduler_loop(
     mut writer: OwnedWriteHalf,
-    mut outbound_rx: mpsc::Receiver<OutboundEnvelope>,
+    mut outbound_rx: mpsc::Receiver<SchedulerCommand>,
     mut stop_rx: watch::Receiver<bool>,
     logger: Logger,
     session_id: String,
     state: Arc<RwLock<SessionState>>,
 ) {
-    let mut movement = MovementTickState::default();
-    let mut st_sync = StSyncState::new();
-
-    let mut movement_tick = interval(timing::movement_tick_interval());
-    let mut keepalive_tick = interval(timing::keepalive_interval());
-    let mut flush_tick = interval(timing::flush_interval());
-    let mut ping_tick = interval(timing::ping_interval());
-    movement_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut scheduler = SchedulerState::new();
+    let start = tokio::time::Instant::now();
+    let mut slot_tick = interval_at(start + timing::send_slot_interval(), timing::send_slot_interval());
+    let mut keepalive_tick = interval_at(
+        start + timing::menu_keepalive_interval(),
+        timing::menu_keepalive_interval(),
+    );
+    slot_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    ping_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    // Fire the first ST immediately to begin the initial calibration burst.
-    let mut st_deadline = tokio::time::Instant::now();
-    let mut st_sleep = Box::pin(tokio::time::sleep_until(st_deadline));
-
-    let mut outbox = Vec::<Document>::new();
+    let far_future = start + Duration::from_secs(60 * 60 * 24 * 365);
+    let mut st_sleep = Box::pin(sleep_until(far_future));
 
     loop {
         tokio::select! {
+            biased;
+
+            _ = async {}, if scheduler.has_immediate_batch() => {
+                if let Some(batch) = scheduler.take_immediate_batch() {
+                    if write_logged_batch(&mut writer, &logger, &session_id, &batch).await.is_err() {
+                        return;
+                    }
+                    let sent_st = scheduler.on_batch_sent(&batch);
+                    if sent_st && scheduler.phase == SchedulerPhase::MenuIdle {
+                        scheduler.phase = SchedulerPhase::MenuStBurst;
+                    }
+                }
+            }
+
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
                     return;
@@ -2919,107 +3265,47 @@ async fn scheduler_loop(
             }
 
             _ = &mut st_sleep => {
-                outbox.push(protocol::make_st());
-                st_sync.last_sent_at = Some(std::time::Instant::now());
-                st_deadline = tokio::time::Instant::now()
-                    + Duration::from_secs(st_sync.interval_secs as u64);
-                st_sleep.as_mut().reset(st_deadline);
-            }
-
-            _ = movement_tick.tick() => {
-                if movement.in_world {
-                    if movement.is_moving {
-                        outbox.push(protocol::make_movement_packet(
-                            movement.world_x,
-                            movement.world_y,
-                            movement.anim,
-                            movement.direction,
-                            false,
-                        ));
-                    }
-                }
+                scheduler.mark_st_due();
+                st_sleep.as_mut().reset(far_future);
             }
 
             _ = keepalive_tick.tick() => {
-                if !movement.in_world {
-                    outbox.push(protocol::make_keepalive());
-                }
+                scheduler.mark_menu_keepalive_due();
             }
 
-            _ = ping_tick.tick() => {
-                if movement.in_world {
-                    if !movement.is_moving {
-                        outbox.push(protocol::make_empty_movement());
-                    }
-                } else {
-                    logger.transport(
-                        TransportKind::Tcp,
-                        Direction::Outgoing,
-                        "tcp",
-                        Some(&session_id),
-                        protocol::log_batch(&outbox),
-                    );
-                    if protocol::write_batch(&mut writer, &outbox).await.is_err() {
+            _ = slot_tick.tick() => {
+                if let Some(batch) = scheduler.take_slot_batch() {
+                    if write_logged_batch(&mut writer, &logger, &session_id, &batch).await.is_err() {
                         return;
                     }
-                    outbox.clear();
-                }
-            }
-
-            _ = flush_tick.tick() => {
-                if !outbox.is_empty() {
-                    logger.transport(
-                        TransportKind::Tcp,
-                        Direction::Outgoing,
-                        "tcp",
-                        Some(&session_id),
-                        protocol::log_batch(&outbox),
-                    );
-                    if protocol::write_batch(&mut writer, &outbox).await.is_err() {
-                        return;
+                    let sent_st = scheduler.on_batch_sent(&batch);
+                    if sent_st && scheduler.phase == SchedulerPhase::MenuIdle {
+                        scheduler.phase = SchedulerPhase::MenuStBurst;
                     }
-                    outbox.clear();
                 }
             }
 
-            Some(envelope) = outbound_rx.recv() => {
-                match envelope {
-                    OutboundEnvelope::Single(doc) => outbox.push(doc),
-                    OutboundEnvelope::Batch(docs) => outbox.extend(docs),
-                    OutboundEnvelope::Control(cmd) => match cmd {
-                        SchedulerCommand::SetMovement { world_x, world_y, is_moving, anim, direction } => {
-                            movement.world_x = world_x;
-                            movement.world_y = world_y;
-                            movement.is_moving = is_moving;
-                            movement.anim = anim;
-                            movement.direction = direction;
+            Some(cmd) = outbound_rx.recv() => {
+                match cmd {
+                    SchedulerCommand::EnqueuePackets { docs, mode, priority } => {
+                        scheduler.enqueue_packets(docs, mode, priority);
+                    }
+                    SchedulerCommand::UpdateMovement { world_x, world_y, is_moving, anim, direction } => {
+                        scheduler.update_movement(world_x, world_y, is_moving, anim, direction);
+                    }
+                    SchedulerCommand::SetPhase { phase } => {
+                        scheduler.set_phase(phase);
+                    }
+                    SchedulerCommand::StResponseReceived => {
+                        if let Some(rtt_ms) = scheduler.st_sync.last_sent_at.map(|sent_at| sent_at.elapsed().as_millis() as u32) {
+                            state.write().await.ping_ms = Some(rtt_ms);
                         }
-                        SchedulerCommand::EnterWorld => {
-                            movement.in_world = true;
+                        if let Some(next) = scheduler.handle_st_response() {
+                            let deadline = tokio::time::Instant::now() + next;
+                            st_sleep.as_mut().reset(deadline);
                         }
-                        SchedulerCommand::LeaveWorld => {
-                            movement.in_world = false;
-                            movement.is_moving = false;
-                        }
-                        SchedulerCommand::StResponseReceived => {
-                            if let Some(sent_at) = st_sync.last_sent_at.take() {
-                                let rtt_ms = sent_at.elapsed().as_millis() as i32;
-                                st_sync.record_sample(rtt_ms);
-                                state.write().await.ping_ms = Some(rtt_ms as u32);
-                                // During the initial burst (< 15 samples) fire the next
-                                // ST immediately, mirroring the chain-reaction in the game
-                                // client (SetTimeOffset sends another RequestServerTime
-                                // until all 15 sample slots are filled).
-                                let next = if st_sync.sample_count < timing::ST_SAMPLE_COUNT {
-                                    Duration::ZERO
-                                } else {
-                                    Duration::from_secs(st_sync.interval_secs as u64)
-                                };
-                                st_deadline = tokio::time::Instant::now() + next;
-                                st_sleep.as_mut().reset(st_deadline);
-                            }
-                        }
-                    },
+                    }
+                    SchedulerCommand::Shutdown => return,
                 }
             }
 
@@ -3060,11 +3346,11 @@ fn decode_inventory(profile: &Document) -> Vec<InventoryEntry> {
 }
 
 async fn run_tutorial_script(
-    session_id: String,
-    logger: Logger,
-    state: Arc<RwLock<SessionState>>,
-    controller_tx: mpsc::Sender<ControllerEvent>,
-    outbound_tx: mpsc::Sender<OutboundEnvelope>,
+    _session_id: String,
+    _logger: Logger,
+    _state: Arc<RwLock<SessionState>>,
+    _controller_tx: mpsc::Sender<ControllerEvent>,
+    _outbound_tx: OutboundHandle,
 ) -> Result<(), String> {
     Ok(())
 }
@@ -3074,7 +3360,7 @@ async fn ensure_world(
     logger: &Logger,
     state: &Arc<RwLock<SessionState>>,
     controller_tx: &mpsc::Sender<ControllerEvent>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     world: &str,
 ) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
@@ -3096,7 +3382,7 @@ async fn ensure_world_cancellable(
     logger: &Logger,
     state: &Arc<RwLock<SessionState>>,
     controller_tx: &mpsc::Sender<ControllerEvent>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     world: &str,
     instance: bool,
     cancel: &AtomicBool,
@@ -3135,7 +3421,7 @@ async fn ensure_world_cancellable(
         } else {
             ""
         };
-        send_docs(outbound_tx, protocol::make_enter_world_eid(world, eid)).await?;
+        send_docs_exclusive(outbound_tx, protocol::make_enter_world_eid(world, eid)).await?;
     } else {
         logger.state(
             Some(session_id),
@@ -3169,42 +3455,88 @@ async fn ensure_world_cancellable(
     }
 }
 
-async fn send_doc(
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
-    doc: Document,
-) -> Result<(), String> {
-    outbound_tx
-        .send(OutboundEnvelope::Single(doc))
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn send_scheduler_cmd(
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
-    cmd: SchedulerCommand,
-) -> Result<(), String> {
-    outbound_tx
-        .send(OutboundEnvelope::Control(cmd))
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn send_docs(
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+async fn enqueue_packets(
+    outbound_tx: &OutboundHandle,
     docs: Vec<Document>,
+    mode: SendMode,
+    priority: QueuePriority,
 ) -> Result<(), String> {
     if docs.is_empty() {
         return Ok(());
     }
     outbound_tx
-        .send(OutboundEnvelope::Batch(docs))
+        .send(SchedulerCommand::EnqueuePackets {
+            docs,
+            mode,
+            priority,
+        })
         .await
         .map_err(|error| error.to_string())
 }
 
+async fn send_doc(outbound_tx: &OutboundHandle, doc: Document) -> Result<(), String> {
+    enqueue_packets(
+        outbound_tx,
+        vec![doc],
+        SendMode::Mergeable,
+        QueuePriority::AfterGenerated,
+    )
+    .await
+}
+
+async fn send_doc_before_generated(
+    outbound_tx: &OutboundHandle,
+    doc: Document,
+) -> Result<(), String> {
+    enqueue_packets(
+        outbound_tx,
+        vec![doc],
+        SendMode::Mergeable,
+        QueuePriority::BeforeGenerated,
+    )
+    .await
+}
+
+async fn send_scheduler_cmd(outbound_tx: &OutboundHandle, cmd: SchedulerCommand) -> Result<(), String> {
+    outbound_tx.send(cmd).await.map_err(|error| error.to_string())
+}
+
+async fn send_docs(outbound_tx: &OutboundHandle, docs: Vec<Document>) -> Result<(), String> {
+    enqueue_packets(
+        outbound_tx,
+        docs,
+        SendMode::Mergeable,
+        QueuePriority::AfterGenerated,
+    )
+    .await
+}
+
+async fn send_docs_exclusive(
+    outbound_tx: &OutboundHandle,
+    docs: Vec<Document>,
+) -> Result<(), String> {
+    enqueue_packets(
+        outbound_tx,
+        docs,
+        SendMode::ExclusiveBatch,
+        QueuePriority::AfterGenerated,
+    )
+    .await
+}
+
+async fn send_docs_immediate(outbound_tx: &OutboundHandle, docs: Vec<Document>) -> Result<(), String> {
+    enqueue_packets(
+        outbound_tx,
+        docs,
+        SendMode::ImmediateExclusive,
+        QueuePriority::AfterGenerated,
+    )
+    .await
+}
+
 async fn walk_to_map(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     target_map_x: i32,
     target_map_y: i32,
 ) -> Result<(), String> {
@@ -3214,7 +3546,7 @@ async fn walk_to_map(
 
 async fn walk_to_map_cancellable(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     target_map_x: i32,
     target_map_y: i32,
     cancel: &AtomicBool,
@@ -3279,7 +3611,7 @@ async fn walk_to_map_cancellable(
     };
     send_scheduler_cmd(
         outbound_tx,
-        SchedulerCommand::SetMovement {
+        SchedulerCommand::UpdateMovement {
             world_x,
             world_y,
             is_moving: false,
@@ -3314,7 +3646,7 @@ async fn wait_for_tutorial_spawn_pod_confirmation(
 
 async fn walk_predefined_path(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     steps: &[(i32, i32)],
 ) -> Result<(), String> {
     let mut previous = {
@@ -3368,7 +3700,7 @@ async fn walk_predefined_path(
     };
     send_scheduler_cmd(
         outbound_tx,
-        SchedulerCommand::SetMovement {
+        SchedulerCommand::UpdateMovement {
             world_x,
             world_y,
             is_moving: false,
@@ -3384,7 +3716,7 @@ async fn manual_move(
     session_id: &str,
     logger: &Logger,
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     direction: &str,
 ) -> Result<(), String> {
     let (target_map_x, target_map_y, facing_direction) = next_manual_step(state, direction).await?;
@@ -3426,10 +3758,10 @@ async fn manual_move(
     );
     set_local_map_position(logger, session_id, state, target_map_x, target_map_y).await;
     let (world_x, world_y) = protocol::map_to_world(target_map_x as f64, target_map_y as f64);
-    send_doc(outbound_tx, protocol::make_map_point(target_map_x, target_map_y)).await?;
+    send_doc_before_generated(outbound_tx, protocol::make_map_point(target_map_x, target_map_y)).await?;
     send_scheduler_cmd(
         outbound_tx,
-        SchedulerCommand::SetMovement {
+        SchedulerCommand::UpdateMovement {
             world_x,
             world_y,
             is_moving: true,
@@ -3441,7 +3773,7 @@ async fn manual_move(
     sleep(tutorial::walk_step_pause()).await;
     send_scheduler_cmd(
         outbound_tx,
-        SchedulerCommand::SetMovement {
+        SchedulerCommand::UpdateMovement {
             world_x,
             world_y,
             is_moving: false,
@@ -3459,7 +3791,7 @@ async fn manual_punch(
     session_id: &str,
     logger: &Logger,
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     offset_x: i32,
     offset_y: i32,
 ) -> Result<(), String> {
@@ -3499,7 +3831,7 @@ async fn manual_punch(
             "manual punch offset=({offset_x}, {offset_y}) -> target=({target_map_x}, {target_map_y}) layer={layer}"
         ),
     );
-    send_docs(
+    send_docs_exclusive(
         outbound_tx,
         vec![
             movement_doc(state, movement::ANIM_PUNCH, facing_direction).await,
@@ -3514,7 +3846,7 @@ async fn manual_place(
     session_id: &str,
     logger: &Logger,
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     offset_x: i32,
     offset_y: i32,
     block_id: i32,
@@ -3528,7 +3860,7 @@ async fn manual_place(
             "manual place block={block_id} offset=({offset_x}, {offset_y}) -> target=({target_map_x}, {target_map_y})"
         ),
     );
-    send_docs(
+    send_docs_exclusive(
         outbound_tx,
         vec![
             movement_doc(state, movement::ANIM_IDLE, facing_direction).await,
@@ -3663,7 +3995,7 @@ fn fallback_straight_line_path(start: (i32, i32), goal: (i32, i32)) -> Vec<(i32,
 
 async fn move_to_map(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     map_x: i32,
     map_y: i32,
     direction: i32,
@@ -3679,11 +4011,11 @@ async fn move_to_map(
         (world_x, world_y)
     };
     // Declare the step to the server (once per step).
-    send_doc(outbound_tx, protocol::make_map_point(map_x, map_y)).await?;
+    send_doc_before_generated(outbound_tx, protocol::make_map_point(map_x, map_y)).await?;
     // Hand position to the scheduler so movement updates continue while walking.
     send_scheduler_cmd(
         outbound_tx,
-        SchedulerCommand::SetMovement {
+        SchedulerCommand::UpdateMovement {
             world_x,
             world_y,
             is_moving: anim != movement::ANIM_IDLE,
@@ -3748,19 +4080,21 @@ async fn movement_doc(state: &Arc<RwLock<SessionState>>, anim: i32, direction: i
 mod tests {
     use std::collections::HashMap;
 
-    use bson::doc;
+    use bson::{Document, doc};
 
     use super::{
-        BotSession, FishingAutomationState, GrowingTileState, SessionState,
+        BotSession, FishingAutomationState, GrowingTileState, QueuePriority, SchedulerPhase,
+        SchedulerState, SendMode, SessionState,
         apply_destroy_block_change, apply_foreground_block_change, is_tile_ready_to_harvest_at,
         update_player_position_from_message,
     };
     use crate::{
+        constants::{movement, protocol as ids, timing},
         logging::{EventHub, Logger},
         models::{PlayerPosition, SessionStatus, WorldSnapshot},
         protocol,
     };
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     fn test_state(
         width: u32,
@@ -3812,6 +4146,12 @@ mod tests {
             fishing: FishingAutomationState::default(),
             ping_ms: None,
         }
+    }
+
+    fn batch_ids(batch: &[Document]) -> Vec<String> {
+        batch.iter()
+            .map(|doc| doc.get_str("ID").unwrap_or_default().to_string())
+            .collect()
     }
 
     #[test]
@@ -3982,6 +4322,152 @@ mod tests {
             .other_players
             .contains_key("remote-user"));
     }
+
+    #[test]
+    fn scheduler_menu_idle_emits_empty_batch_when_idle() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::MenuIdle);
+        scheduler.st_due = false;
+
+        let batch = scheduler.take_slot_batch().unwrap();
+
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn scheduler_mergeable_packets_replace_menu_empty_batch() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::MenuIdle);
+        scheduler.st_due = false;
+        scheduler.enqueue_packets(
+            vec![doc! { "ID": "HB" }],
+            SendMode::Mergeable,
+            QueuePriority::AfterGenerated,
+        );
+
+        let batch = scheduler.take_slot_batch().unwrap();
+
+        assert_eq!(batch_ids(&batch), vec!["HB".to_string()]);
+    }
+
+    #[test]
+    fn scheduler_world_batch_keeps_pre_and_post_generated_order() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::WorldIdle);
+        scheduler.st_due = false;
+        scheduler.update_movement(12.8, 9.44, true, movement::ANIM_WALK, movement::DIR_RIGHT);
+        scheduler.enqueue_packets(
+            vec![protocol::make_map_point(41, 30)],
+            SendMode::Mergeable,
+            QueuePriority::BeforeGenerated,
+        );
+        scheduler.enqueue_packets(
+            vec![doc! { "ID": "HB" }],
+            SendMode::Mergeable,
+            QueuePriority::AfterGenerated,
+        );
+
+        let batch = scheduler.take_slot_batch().unwrap();
+
+        assert_eq!(
+            batch_ids(&batch),
+            vec![
+                ids::PACKET_ID_MAP_POINT.to_string(),
+                ids::PACKET_ID_MOVEMENT.to_string(),
+                "HB".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scheduler_world_idle_emits_empty_movement_packet() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::WorldIdle);
+        scheduler.st_due = false;
+
+        let batch = scheduler.take_slot_batch().unwrap();
+
+        assert_eq!(batch_ids(&batch), vec![ids::PACKET_ID_MOVEMENT.to_string()]);
+    }
+
+    #[test]
+    fn scheduler_exclusive_batch_stays_isolated() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::MenuIdle);
+        scheduler.st_due = false;
+        scheduler.enqueue_packets(
+            vec![doc! { "ID": "A" }],
+            SendMode::Mergeable,
+            QueuePriority::AfterGenerated,
+        );
+        scheduler.enqueue_packets(
+            vec![doc! { "ID": "X" }, doc! { "ID": "Y" }],
+            SendMode::ExclusiveBatch,
+            QueuePriority::AfterGenerated,
+        );
+
+        let first = scheduler.take_slot_batch().unwrap();
+        let second = scheduler.take_slot_batch().unwrap();
+
+        assert_eq!(batch_ids(&first), vec!["A".to_string()]);
+        assert_eq!(batch_ids(&second), vec!["X".to_string(), "Y".to_string()]);
+    }
+
+    #[test]
+    fn scheduler_immediate_exclusive_preempts_slot_batches() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::MenuIdle);
+        scheduler.st_due = false;
+        scheduler.enqueue_packets(
+            vec![doc! { "ID": "queued" }],
+            SendMode::Mergeable,
+            QueuePriority::AfterGenerated,
+        );
+        scheduler.enqueue_packets(
+            vec![doc! { "ID": "now" }],
+            SendMode::ImmediateExclusive,
+            QueuePriority::AfterGenerated,
+        );
+
+        let immediate = scheduler.take_immediate_batch().unwrap();
+        let later = scheduler.take_slot_batch().unwrap();
+
+        assert_eq!(batch_ids(&immediate), vec!["now".to_string()]);
+        assert_eq!(batch_ids(&later), vec!["queued".to_string()]);
+    }
+
+    #[test]
+    fn scheduler_menu_keepalive_and_st_share_the_same_slot() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::MenuIdle);
+        scheduler.menu_keepalive_due = true;
+        scheduler.st_due = true;
+
+        let batch = scheduler.take_slot_batch().unwrap();
+
+        assert_eq!(
+            batch_ids(&batch),
+            vec![
+                ids::PACKET_ID_KEEPALIVE.to_string(),
+                ids::PACKET_ID_ST.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scheduler_st_response_keeps_burst_active_until_sample_window_is_full() {
+        let mut scheduler = SchedulerState::new();
+        scheduler.set_phase(SchedulerPhase::MenuStBurst);
+        scheduler.st_sync.sample_count = timing::ST_SAMPLE_COUNT - 1;
+        scheduler.st_sync.last_sent_at = Some(std::time::Instant::now() - Duration::from_millis(25));
+        scheduler.st_due = false;
+
+        let next = scheduler.handle_st_response();
+
+        assert!(next.is_some());
+        assert_eq!(scheduler.phase, SchedulerPhase::MenuIdle);
+        assert!(!scheduler.st_due);
+    }
 }
 
 async fn inventory_key_for(
@@ -4106,7 +4592,7 @@ async fn set_local_map_position(
 
 async fn collect_all_visible_collectables(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
 ) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
     collect_all_visible_collectables_cancellable(state, outbound_tx, &cancel).await
@@ -4114,7 +4600,7 @@ async fn collect_all_visible_collectables(
 
 async fn collect_all_visible_collectables_cancellable(
     state: &Arc<RwLock<SessionState>>,
-    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    outbound_tx: &OutboundHandle,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     ensure_not_cancelled(cancel)?;
