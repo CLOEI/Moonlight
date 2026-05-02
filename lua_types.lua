@@ -145,8 +145,8 @@ function Bot:collect() end
 ---@param ms number
 function Bot:sleep(ms) end
 
---- Sends a raw packet built from a Lua table. The table must include a string `ID`.
----@param packet PacketBase|table
+--- Sends a raw packet. The packet must be a PacketBase with a string ID.
+---@param packet PacketBase
 function Bot:sendPacket(packet) end
 
 --- Returns the current position of the bot.
@@ -190,4 +190,4 @@ function Bot:getWorld() end
 
 --- The global bot instance for the active Moonlight session.
 ---@type Bot
-bot = bot
+bot = nil
