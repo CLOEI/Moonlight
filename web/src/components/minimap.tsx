@@ -1,299 +1,419 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Application, extend } from "@pixi/react"
-import { Container, Graphics } from "pixi.js"
+import { memo, useCallback, useEffect, useRef, useState } from "react"
 
-import {
-  blendColor,
-  fitMinimapView,
-  minimapColor,
-  tileAtCanvasPoint,
-  type MinimapHoverTile,
-  type MinimapView,
-} from "@/lib/dashboard"
+import { minimapColor } from "@/lib/dashboard"
 import type { MinimapSnapshot, PlayerPosition } from "@/lib/types"
-
-extend({ Container, Graphics })
+import { getAtlas, peekAtlas, type AtlasBundle } from "@/lib/atlas"
 
 type Props = {
   minimap: MinimapSnapshot | null
   playerPosition: PlayerPosition
+  currentWorld: string | null
   onHoverChange: (value: string) => void
 }
 
-const INITIAL_VIEW: MinimapView = {
-  zoom: 1,
-  minZoom: 1,
-  maxZoom: 32,
-  offsetX: 0,
-  offsetY: 0,
-  hasInteracted: false,
+const MIN_ZOOM = 0.5
+const MAX_ZOOM = 16
+
+function unpackColor(value: number): [number, number, number] {
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
 }
 
-export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) {
-  const containerRef = useRef<HTMLDivElement | null>(null)
-  const [size, setSize] = useState({ width: 0, height: 0 })
-  const [view, setView] = useState<MinimapView>(INITIAL_VIEW)
+function blend(
+  base: [number, number, number],
+  overlay: [number, number, number],
+  alpha: number,
+): [number, number, number] {
+  return [
+    Math.round(base[0] * (1 - alpha) + overlay[0] * alpha),
+    Math.round(base[1] * (1 - alpha) + overlay[1] * alpha),
+    Math.round(base[2] * (1 - alpha) + overlay[2] * alpha),
+  ]
+}
+
+function rasterize(
+  snap: MinimapSnapshot,
+  atlasTiles?: Record<string, [number, number]>,
+): ImageData {
+  const { width, height, foreground_tiles, background_tiles, water_tiles, wiring_tiles } = snap
+  const data = new Uint8ClampedArray(width * height * 4)
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const i = y * width + x
+      const screenY = height - 1 - y
+      const o = (screenY * width + x) * 4
+      const bg = background_tiles[i] ?? 0
+      const fg = foreground_tiles[i] ?? 0
+      const w = water_tiles[i] ?? 0
+      const wr = wiring_tiles[i] ?? 0
+      let c: [number, number, number] = bg
+        ? unpackColor(minimapColor(bg, "background"))
+        : [16, 22, 34]
+      const fgHasSprite = !!fg && !!atlasTiles && atlasTiles[String(fg)] !== undefined
+      if (fg && !fgHasSprite) c = unpackColor(minimapColor(fg, "foreground"))
+      if (w) c = blend(c, unpackColor(minimapColor(w, "water")), 0.55)
+      if (wr) c = blend(c, unpackColor(minimapColor(wr, "wiring")), 0.45)
+      data[o] = c[0]
+      data[o + 1] = c[1]
+      data[o + 2] = c[2]
+      data[o + 3] = 255
+    }
+  }
+  return new ImageData(data, width, height)
+}
+
+interface TileInfo {
+  mapX: number
+  mapY: number
+  fg: number
+  bg: number
+  water: number
+  wiring: number
+}
+
+function MinimapPanelImpl({ minimap, playerPosition, currentWorld, onHoverChange }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const tileLayerRef = useRef<HTMLCanvasElement | null>(null)
+  const atlasImgRef = useRef<HTMLImageElement | null>(null)
+  const atlasMetaRef = useRef<{ cell: number; tiles: Record<string, [number, number]> } | null>(
+    null,
+  )
+  const [atlasResolved, setAtlasResolved] = useState(() => peekAtlas() !== null)
+  const [hover, setHover] = useState<TileInfo | null>(null)
+  const [view, setView] = useState({ zoom: 1, panX: 0, panY: 0 })
+  const viewRef = useRef(view)
+  const layoutRef = useRef({ dx: 0, dy: 0, scale: 1, w: 0, h: 0 })
+  const onHoverChangeRef = useRef(onHoverChange)
+  onHoverChangeRef.current = onHoverChange
 
   useEffect(() => {
-    const container = containerRef.current
-    if (!container) {
+    const cached = peekAtlas()
+    if (cached) {
+      atlasImgRef.current = cached.image
+      atlasMetaRef.current = cached.meta
       return
     }
-    const observer = new ResizeObserver(([entry]) => {
-      setSize({
-        width: entry.contentRect.width,
-        height: entry.contentRect.height,
-      })
+    let cancelled = false
+    getAtlas().then((bundle: AtlasBundle | null) => {
+      if (cancelled) return
+      if (bundle) {
+        atlasImgRef.current = bundle.image
+        atlasMetaRef.current = bundle.meta
+      }
+      setAtlasResolved(true)
     })
-    observer.observe(container)
-    return () => observer.disconnect()
+    return () => {
+      cancelled = true
+    }
   }, [])
 
+  const lastWorldRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!minimap || !size.width || !size.height) {
-      setView(INITIAL_VIEW)
+    if (lastWorldRef.current !== currentWorld) {
+      lastWorldRef.current = currentWorld
+      setView({ zoom: 1, panX: 0, panY: 0 })
+    }
+  }, [currentWorld])
+
+  useEffect(() => {
+    viewRef.current = view
+  }, [view])
+
+  useEffect(() => {
+    if (!minimap || !atlasResolved) {
+      tileLayerRef.current = null
       return
     }
-    setView((current) =>
-      current.hasInteracted
-        ? current
-        : fitMinimapView(size.width, size.height, minimap.width, minimap.height),
-    )
-  }, [minimap, size.height, size.width])
+    const off = document.createElement("canvas")
+    off.width = minimap.width
+    off.height = minimap.height
+    const ctx = off.getContext("2d")
+    if (!ctx) return
+    ctx.putImageData(rasterize(minimap, atlasMetaRef.current?.tiles), 0, 0)
+    tileLayerRef.current = off
+  }, [minimap, atlasResolved])
 
-  const resolution = useMemo(
-    () => (typeof window === "undefined" ? 1 : window.devicePixelRatio || 1),
-    [],
-  )
+  const drawScene = useCallback(() => {
+    const canvas = canvasRef.current
+    const layer = tileLayerRef.current
+    if (!canvas || !minimap) return
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
 
-  const drawTiles = useCallback(
-    (graphics: Graphics) => {
-      graphics.clear()
-      if (!minimap) {
-        return
+    const cw = canvas.clientWidth
+    const ch = canvas.clientHeight
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width = cw
+      canvas.height = ch
+    }
+
+    const v = viewRef.current
+    const fitScale = Math.min(cw / minimap.width, ch / minimap.height)
+    const scale = fitScale * v.zoom
+    const dw = minimap.width * scale
+    const dh = minimap.height * scale
+    const dx = (cw - dw) / 2 + v.panX
+    const dy = (ch - dh) / 2 + v.panY
+    layoutRef.current = { dx, dy, scale, w: minimap.width, h: minimap.height }
+
+    ctx.imageSmoothingEnabled = false
+    ctx.fillStyle = "#0a0f18"
+    ctx.fillRect(0, 0, cw, ch)
+    if (layer) {
+      ctx.drawImage(layer, dx, dy, dw, dh)
+    }
+
+    const atlas = atlasImgRef.current
+    const meta = atlasMetaRef.current
+    if (atlas && meta && scale >= 3) {
+      const cell = meta.cell
+      const fg = minimap.foreground_tiles
+      const bg = minimap.background_tiles
+
+      ctx.globalAlpha = 0.5
+      for (let y = 0; y < minimap.height; y += 1) {
+        for (let x = 0; x < minimap.width; x += 1) {
+          const idx = y * minimap.width + x
+          const bgId = bg[idx]
+          if (!bgId) continue
+          const pos = meta.tiles[String(bgId)]
+          if (!pos) continue
+          const screenY = minimap.height - 1 - y
+          ctx.drawImage(
+            atlas,
+            pos[0],
+            pos[1],
+            cell,
+            cell,
+            dx + x * scale,
+            dy + screenY * scale,
+            scale,
+            scale,
+          )
+        }
       }
+      ctx.globalAlpha = 1.0
 
       for (let y = 0; y < minimap.height; y += 1) {
         for (let x = 0; x < minimap.width; x += 1) {
-          const tileIndex = y * minimap.width + x
-          let color = minimap.background_tiles[tileIndex]
-            ? minimapColor(minimap.background_tiles[tileIndex], "background")
-            : 0x87ceeb
-
-          if (minimap.foreground_tiles[tileIndex]) {
-            color = minimapColor(minimap.foreground_tiles[tileIndex], "foreground")
-          }
-          if (minimap.water_tiles[tileIndex]) {
-            color = blendColor(
-              color,
-              minimapColor(minimap.water_tiles[tileIndex], "water"),
-              0.55,
-            )
-          }
-          if (minimap.wiring_tiles[tileIndex]) {
-            color = blendColor(
-              color,
-              minimapColor(minimap.wiring_tiles[tileIndex], "wiring"),
-              0.45,
-            )
-          }
-
-          graphics.setFillStyle({ color })
-          graphics.rect(x, minimap.height - y - 1, 1, 1)
-          graphics.fill()
+          const fgId = fg[y * minimap.width + x]
+          if (!fgId) continue
+          const pos = meta.tiles[String(fgId)]
+          if (!pos) continue
+          const screenY = minimap.height - 1 - y
+          ctx.drawImage(
+            atlas,
+            pos[0],
+            pos[1],
+            cell,
+            cell,
+            dx + x * scale,
+            dy + screenY * scale,
+            scale,
+            scale,
+          )
         }
       }
-    },
-    [minimap],
-  )
-
-  const drawPlayer = useCallback(
-    (graphics: Graphics) => {
-      graphics.clear()
-      if (!minimap) {
-        return
-      }
-      for (const otherPlayer of minimap.other_players) {
-        const { map_x, map_y } = otherPlayer.position
-        if (map_x == null || map_y == null) {
-          continue
-        }
-        const x = Math.min(Math.max(map_x, 0), minimap.width - 1)
-        const y = Math.min(Math.max(map_y, 0), minimap.height - 1)
-        graphics.setFillStyle({ color: 0xa855f7 })
-        graphics.circle(x + 0.5, minimap.height - y - 0.5, 0.32)
-        graphics.fill()
-      }
-      if (playerPosition.map_x == null || playerPosition.map_y == null) {
-        return
-      }
-      const x = Math.min(Math.max(playerPosition.map_x, 0), minimap.width - 1)
-      const y = Math.min(Math.max(playerPosition.map_y, 0), minimap.height - 1)
-      graphics.setFillStyle({ color: 0xff3b30 })
-      graphics.circle(x + 0.5, minimap.height - y - 0.5, 0.4)
-      graphics.fill()
-      graphics.setStrokeStyle({ color: 0xffffff, width: 0.08 })
-      graphics.stroke()
-    },
-    [minimap, playerPosition.map_x, playerPosition.map_y],
-  )
-
-  const drawHover = useCallback(
-    (graphics: Graphics) => {
-      graphics.clear()
-      if (!minimap) {
-        return
-      }
-      const text = containerRef.current?.dataset.hoverTile
-      if (!text) {
-        return
-      }
-      const [mapX, mapY] = text.split(",").map(Number)
-      if (!Number.isFinite(mapX) || !Number.isFinite(mapY)) {
-        return
-      }
-      graphics.setStrokeStyle({ color: 0xffffff, width: 0.08 })
-      graphics.rect(mapX, minimap.height - mapY - 1, 1, 1)
-      graphics.stroke()
-    },
-    [minimap],
-  )
-
-  const updateHover = (tile: MinimapHoverTile | null) => {
-    if (!containerRef.current) {
-      return
     }
-    if (!tile) {
-      delete containerRef.current.dataset.hoverTile
-      onHoverChange("Hover a tile to inspect it.")
-      return
-    }
-    containerRef.current.dataset.hoverTile = `${tile.mapX},${tile.mapY}`
-    onHoverChange(
-      `hover tile=(${tile.mapX}, ${tile.mapY}) fg=${tile.foreground} bg=${tile.background} water=${tile.water} wiring=${tile.wiring}`,
-    )
-  }
 
-  const pointerOrigin = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(
-    null,
-  )
-
-  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!minimap || !containerRef.current) {
-      return
+    if (hover) {
+      const hx = dx + hover.mapX * scale
+      const hy = dy + (minimap.height - hover.mapY - 1) * scale
+      ctx.strokeStyle = "#ffffff"
+      ctx.lineWidth = 1.5
+      ctx.strokeRect(hx, hy, scale, scale)
     }
-    if (pointerOrigin.current) {
-      event.preventDefault()
-    }
-    const rect = containerRef.current.getBoundingClientRect()
-    const tile = tileAtCanvasPoint(
-      {
-        x: event.clientX - rect.left,
-        y: event.clientY - rect.top,
-      },
-      minimap,
-      view,
-    )
-    updateHover(tile)
 
-    if (!pointerOrigin.current) {
-      return
+    for (const op of minimap.other_players) {
+      if (op.position.map_x == null || op.position.map_y == null) continue
+      const sx = dx + op.position.map_x * scale + scale / 2
+      const sy = dy + (minimap.height - op.position.map_y - 1) * scale + scale / 2
+      ctx.fillStyle = "#a855f7"
+      ctx.beginPath()
+      ctx.arc(sx, sy, Math.max(2, scale * 0.45), 0, Math.PI * 2)
+      ctx.fill()
     }
-    setView((current) => ({
-      ...current,
-      hasInteracted: true,
-      offsetX: pointerOrigin.current!.offsetX + (event.clientX - pointerOrigin.current!.x),
-      offsetY: pointerOrigin.current!.offsetY + (event.clientY - pointerOrigin.current!.y),
-    }))
-  }
 
-  const handleWheelEvent = useCallback((event: WheelEvent) => {
-    if (!minimap || !containerRef.current) {
-      return
+    const px = playerPosition.map_x
+    const py = playerPosition.map_y
+    if (px != null && py != null) {
+      const sx = dx + px * scale + scale / 2
+      const sy = dy + (minimap.height - py - 1) * scale + scale / 2
+      ctx.fillStyle = "#ff3b30"
+      ctx.beginPath()
+      ctx.arc(sx, sy, Math.max(3, scale * 0.6), 0, Math.PI * 2)
+      ctx.fill()
+      ctx.strokeStyle = "#ffffff"
+      ctx.lineWidth = 1
+      ctx.stroke()
     }
-    event.preventDefault()
-    event.stopPropagation()
-    const rect = containerRef.current.getBoundingClientRect()
-    const pointX = event.clientX - rect.left
-    const pointY = event.clientY - rect.top
-    const zoomFactor = event.deltaY < 0 ? 1.15 : 1 / 1.15
+  }, [minimap, hover, playerPosition.map_x, playerPosition.map_y])
 
-    setView((current) => {
-      const nextZoom = Math.min(
-        current.maxZoom,
-        Math.max(current.minZoom, current.zoom * zoomFactor),
-      )
-      const worldX = (pointX - current.offsetX) / current.zoom
-      const worldY = (pointY - current.offsetY) / current.zoom
-      return {
-        ...current,
-        hasInteracted: true,
-        zoom: nextZoom,
-        offsetX: pointX - worldX * nextZoom,
-        offsetY: pointY - worldY * nextZoom,
-      }
-    })
-  }, [minimap])
+  const drawSceneRef = useRef(drawScene)
+  drawSceneRef.current = drawScene
 
   useEffect(() => {
-    const container = containerRef.current
-    if (!container) {
-      return
+    drawSceneRef.current()
+  }, [minimap, atlasResolved, view, hover, playerPosition.map_x, playerPosition.map_y])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const observer = new ResizeObserver(() => drawSceneRef.current())
+    observer.observe(canvas)
+    return () => observer.disconnect()
+  }, [])
+
+  const screenToTile = useCallback(
+    (clientX: number, clientY: number): TileInfo | null => {
+      if (!minimap) return null
+      const canvas = canvasRef.current
+      if (!canvas) return null
+      const rect = canvas.getBoundingClientRect()
+      const cx = clientX - rect.left
+      const cy = clientY - rect.top
+      const { dx, dy, scale, w, h } = layoutRef.current
+      const mapX = Math.floor((cx - dx) / scale)
+      const screenY = Math.floor((cy - dy) / scale)
+      const mapY = h - 1 - screenY
+      if (mapX < 0 || mapX >= w || mapY < 0 || mapY >= h) return null
+      const i = mapY * w + mapX
+      return {
+        mapX,
+        mapY,
+        fg: minimap.foreground_tiles[i] ?? 0,
+        bg: minimap.background_tiles[i] ?? 0,
+        water: minimap.water_tiles[i] ?? 0,
+        wiring: minimap.wiring_tiles[i] ?? 0,
+      }
+    },
+    [minimap],
+  )
+
+  const dragRef = useRef<{
+    startX: number
+    startY: number
+    panX0: number
+    panY0: number
+    moved: boolean
+  } | null>(null)
+
+  const updateHover = useCallback((tile: TileInfo | null) => {
+    setHover((current) => {
+      const sameKey =
+        (current?.mapX ?? null) === (tile?.mapX ?? null) &&
+        (current?.mapY ?? null) === (tile?.mapY ?? null)
+      if (sameKey) return current
+      if (!tile) {
+        onHoverChangeRef.current("Hover a tile to inspect it.")
+        return null
+      }
+      onHoverChangeRef.current(
+        `hover tile=(${tile.mapX}, ${tile.mapY}) fg=${tile.fg} bg=${tile.bg} water=${tile.water} wiring=${tile.wiring}`,
+      )
+      return tile
+    })
+  }, [])
+
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0) return
+    const v = viewRef.current
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      panX0: v.panX,
+      panY0: v.panY,
+      moved: false,
     }
-    container.addEventListener("wheel", handleWheelEvent, { passive: false })
-    return () => container.removeEventListener("wheel", handleWheelEvent)
-  }, [handleWheelEvent])
+    ;(e.currentTarget as HTMLCanvasElement).setPointerCapture(e.pointerId)
+  }, [])
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      const tile = screenToTile(e.clientX, e.clientY)
+      updateHover(tile)
+      const drag = dragRef.current
+      if (!drag) return
+      const dx = e.clientX - drag.startX
+      const dy = e.clientY - drag.startY
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 5) {
+        drag.moved = true
+      }
+      if (drag.moved) {
+        e.preventDefault()
+        setView((prev) => ({ ...prev, panX: drag.panX0 + dx, panY: drag.panY0 + dy }))
+      }
+    },
+    [screenToTile, updateHover],
+  )
+
+  const onPointerUp = useCallback((e: React.PointerEvent) => {
+    if (dragRef.current) {
+      try {
+        ;(e.currentTarget as HTMLCanvasElement).releasePointerCapture(e.pointerId)
+      } catch {
+        /* noop */
+      }
+    }
+    dragRef.current = null
+  }, [])
+
+  const onPointerLeave = useCallback(() => {
+    updateHover(null)
+  }, [updateHover])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const handler = (e: WheelEvent) => {
+      if (!minimap) return
+      e.preventDefault()
+      const rect = canvas.getBoundingClientRect()
+      const cx = e.clientX - rect.left
+      const cy = e.clientY - rect.top
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15
+      setView((v) => {
+        const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.zoom * factor))
+        const ratio = nextZoom / v.zoom
+        return {
+          zoom: nextZoom,
+          panX: cx - (cx - v.panX) * ratio,
+          panY: cy - (cy - v.panY) * ratio,
+        }
+      })
+    }
+    canvas.addEventListener("wheel", handler, { passive: false })
+    return () => canvas.removeEventListener("wheel", handler)
+  }, [minimap])
 
   return (
-    <div
-      ref={containerRef}
-      className="relative h-80 overflow-hidden rounded-2xl border border-white/10 bg-[#081018]"
-      onPointerDown={(event) => {
-        event.preventDefault()
-        pointerOrigin.current = {
-          x: event.clientX,
-          y: event.clientY,
-          offsetX: view.offsetX,
-          offsetY: view.offsetY,
-        }
-        event.currentTarget.setPointerCapture(event.pointerId)
-      }}
-      onPointerUp={() => {
-        pointerOrigin.current = null
-      }}
-      onPointerLeave={() => {
-        pointerOrigin.current = null
-        updateHover(null)
-      }}
-      onPointerCancel={() => {
-        pointerOrigin.current = null
-      }}
-      onPointerMove={handlePointerMove}
-      style={{ touchAction: "none" }}
-    >
-      {minimap && size.width > 0 && size.height > 0 ? (
-        <Application
-          resizeTo={containerRef}
-          backgroundAlpha={0}
-          antialias={false}
-          autoDensity
-          resolution={resolution}
-        >
-          <pixiContainer
-            x={view.offsetX}
-            y={view.offsetY}
-            scale={view.zoom}
-          >
-            <pixiGraphics draw={drawTiles} />
-            <pixiGraphics draw={drawHover} />
-            <pixiGraphics draw={drawPlayer} />
-          </pixiContainer>
-        </Application>
-      ) : (
-        <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+    <div className="relative h-80 overflow-hidden rounded-2xl border border-white/10 bg-[#081018]">
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 h-full w-full cursor-crosshair"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        onPointerLeave={onPointerLeave}
+        style={{ touchAction: "none" }}
+      />
+      {!minimap && (
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
           No minimap yet.
         </div>
       )}
     </div>
   )
 }
+
+export const MinimapPanel = memo(MinimapPanelImpl, (prev, next) => {
+  return (
+    prev.minimap === next.minimap &&
+    prev.onHoverChange === next.onHoverChange &&
+    prev.currentWorld === next.currentWorld &&
+    prev.playerPosition.map_x === next.playerPosition.map_x &&
+    prev.playerPosition.map_y === next.playerPosition.map_y &&
+    prev.playerPosition.world_x === next.playerPosition.world_x &&
+    prev.playerPosition.world_y === next.playerPosition.world_y
+  )
+})
