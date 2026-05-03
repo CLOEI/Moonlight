@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Application, extend } from "@pixi/react"
-import { Container, Graphics } from "pixi.js"
+import { Container, Graphics, Sprite, Texture } from "pixi.js"
 
 import {
-  blendColor,
   fitMinimapView,
   minimapColor,
   tileAtCanvasPoint,
@@ -11,8 +10,9 @@ import {
   type MinimapView,
 } from "@/lib/dashboard"
 import type { MinimapSnapshot, PlayerPosition } from "@/lib/types"
+import { getAtlas, peekAtlas, type AtlasBundle } from "@/lib/atlas"
 
-extend({ Container, Graphics })
+extend({ Container, Graphics, Sprite })
 
 type Props = {
   minimap: MinimapSnapshot | null
@@ -29,10 +29,133 @@ const INITIAL_VIEW: MinimapView = {
   hasInteracted: false,
 }
 
+function unpackColor(value: number): [number, number, number] {
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
+}
+
+function blendRgb(
+  base: [number, number, number],
+  overlay: [number, number, number],
+  alpha: number,
+): [number, number, number] {
+  return [
+    Math.round(base[0] * (1 - alpha) + overlay[0] * alpha),
+    Math.round(base[1] * (1 - alpha) + overlay[1] * alpha),
+    Math.round(base[2] * (1 - alpha) + overlay[2] * alpha),
+  ]
+}
+
+function rasterizeMinimap(
+  snap: MinimapSnapshot,
+  atlas: AtlasBundle | null,
+): HTMLCanvasElement {
+  const { width, height, foreground_tiles, background_tiles, water_tiles, wiring_tiles } = snap
+  const tiles = atlas?.meta.tiles
+
+  const colorCanvas = document.createElement("canvas")
+  colorCanvas.width = width
+  colorCanvas.height = height
+  const colorCtx = colorCanvas.getContext("2d")
+  if (!colorCtx) return colorCanvas
+
+  const baseImage = colorCtx.createImageData(width, height)
+  const data = baseImage.data
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const i = y * width + x
+      const screenY = height - 1 - y
+      const o = (screenY * width + x) * 4
+      const bg = background_tiles[i] ?? 0
+      const fg = foreground_tiles[i] ?? 0
+      const w = water_tiles[i] ?? 0
+      const wr = wiring_tiles[i] ?? 0
+
+      let c: [number, number, number] = bg
+        ? unpackColor(minimapColor(bg, "background"))
+        : [135, 206, 235]
+      const fgHasSprite = !!fg && !!tiles && tiles[String(fg)] !== undefined
+      if (fg && !fgHasSprite) c = unpackColor(minimapColor(fg, "foreground"))
+      if (w) c = blendRgb(c, unpackColor(minimapColor(w, "water")), 0.55)
+      if (wr) c = blendRgb(c, unpackColor(minimapColor(wr, "wiring")), 0.45)
+
+      data[o] = c[0]
+      data[o + 1] = c[1]
+      data[o + 2] = c[2]
+      data[o + 3] = 255
+    }
+  }
+  colorCtx.putImageData(baseImage, 0, 0)
+
+  if (!atlas || !tiles) return colorCanvas
+
+  const cell = atlas.meta.cell
+  const fullCanvas = document.createElement("canvas")
+  fullCanvas.width = width * cell
+  fullCanvas.height = height * cell
+  const ctx = fullCanvas.getContext("2d")
+  if (!ctx) return colorCanvas
+
+  ctx.imageSmoothingEnabled = false
+  ctx.drawImage(colorCanvas, 0, 0, width, height, 0, 0, width * cell, height * cell)
+
+  ctx.globalAlpha = 0.5
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const bgId = background_tiles[y * width + x]
+      if (!bgId) continue
+      const pos = tiles[String(bgId)]
+      if (!pos) continue
+      const screenY = height - 1 - y
+      ctx.drawImage(atlas.image, pos[0], pos[1], cell, cell, x * cell, screenY * cell, cell, cell)
+    }
+  }
+  ctx.globalAlpha = 1.0
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const fgId = foreground_tiles[y * width + x]
+      if (!fgId) continue
+      const pos = tiles[String(fgId)]
+      if (!pos) continue
+      const screenY = height - 1 - y
+      ctx.drawImage(atlas.image, pos[0], pos[1], cell, cell, x * cell, screenY * cell, cell, cell)
+    }
+  }
+
+  return fullCanvas
+}
+
 export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [view, setView] = useState<MinimapView>(INITIAL_VIEW)
+  const [atlas, setAtlas] = useState<AtlasBundle | null>(() => peekAtlas())
+  const [texture, setTexture] = useState<Texture>(Texture.EMPTY)
+
+  useEffect(() => {
+    if (atlas) return
+    let live = true
+    getAtlas().then((b) => {
+      if (live && b) setAtlas(b)
+    })
+    return () => {
+      live = false
+    }
+  }, [atlas])
+
+  useEffect(() => {
+    if (!minimap) {
+      setTexture(Texture.EMPTY)
+      return
+    }
+    const canvas = rasterizeMinimap(minimap, atlas)
+    const tex = Texture.from(canvas)
+    tex.source.scaleMode = "nearest"
+    setTexture(tex)
+    return () => {
+      tex.destroy(true)
+    }
+  }, [minimap, atlas])
 
   useEffect(() => {
     const container = containerRef.current
@@ -64,47 +187,6 @@ export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) 
   const resolution = useMemo(
     () => (typeof window === "undefined" ? 1 : window.devicePixelRatio || 1),
     [],
-  )
-
-  const drawTiles = useCallback(
-    (graphics: Graphics) => {
-      graphics.clear()
-      if (!minimap) {
-        return
-      }
-
-      for (let y = 0; y < minimap.height; y += 1) {
-        for (let x = 0; x < minimap.width; x += 1) {
-          const tileIndex = y * minimap.width + x
-          let color = minimap.background_tiles[tileIndex]
-            ? minimapColor(minimap.background_tiles[tileIndex], "background")
-            : 0x87ceeb
-
-          if (minimap.foreground_tiles[tileIndex]) {
-            color = minimapColor(minimap.foreground_tiles[tileIndex], "foreground")
-          }
-          if (minimap.water_tiles[tileIndex]) {
-            color = blendColor(
-              color,
-              minimapColor(minimap.water_tiles[tileIndex], "water"),
-              0.55,
-            )
-          }
-          if (minimap.wiring_tiles[tileIndex]) {
-            color = blendColor(
-              color,
-              minimapColor(minimap.wiring_tiles[tileIndex], "wiring"),
-              0.45,
-            )
-          }
-
-          graphics.setFillStyle({ color })
-          graphics.rect(x, minimap.height - y - 1, 1, 1)
-          graphics.fill()
-        }
-      }
-    },
-    [minimap],
   )
 
   const drawPlayer = useCallback(
@@ -284,7 +366,12 @@ export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) 
             y={view.offsetY}
             scale={view.zoom}
           >
-            <pixiGraphics draw={drawTiles} />
+            {texture !== Texture.EMPTY && (
+              <pixiSprite
+                texture={texture}
+                scale={atlas ? 1 / atlas.meta.cell : 1}
+              />
+            )}
             <pixiGraphics draw={drawHover} />
             <pixiGraphics draw={drawPlayer} />
           </pixiContainer>

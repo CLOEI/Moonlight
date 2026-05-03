@@ -41,6 +41,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { MinimapPanel } from "@/components/minimap"
+import { TileSprite } from "@/components/TileSprite"
 import {
   automateTutorial,
   connectWithAuth,
@@ -980,6 +981,12 @@ function App() {
                                       key={`${session.id}-${item.block_id}-${item.inventory_type}`}
                                       className="grid min-w-[92px] flex-1 gap-1 rounded-xl border border-white/10 bg-white/4 p-2.5 text-center sm:min-w-[110px] sm:flex-none sm:p-3"
                                     >
+                                      <TileSprite
+                                        blockId={item.block_id}
+                                        size={40}
+                                        className="mx-auto"
+                                        fallback={<span className="text-[9px] text-muted-foreground">?</span>}
+                                      />
                                       <div className="font-mono text-[11px] text-muted-foreground">
                                         #{item.block_id}
                                       </div>
