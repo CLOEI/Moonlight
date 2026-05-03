@@ -41,6 +41,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { MinimapPanel } from "@/components/minimap"
+import { TileSprite } from "@/components/TileSprite"
 import {
   automateTutorial,
   connectWithAuth,
@@ -427,20 +428,67 @@ function App() {
     }
   }, [dashboardAuthenticated, dashboardToken, upsertSession])
 
-  const refreshMinimap = useCallback(async (sessionId: string) => {
+  const minimapFetchAtRef = useRef<Record<string, number>>({})
+  const minimapFetchedWorldRef = useRef<Record<string, string | null>>({})
+  const minimapWorldChangedAtRef = useRef<Record<string, number>>({})
+
+  const refreshMinimap = useCallback(async (sessionId: string, currentWorld: string | null) => {
+    const lastWorld = minimapFetchedWorldRef.current[sessionId]
+    const worldChanged = lastWorld !== currentWorld
+    if (worldChanged) {
+      minimapFetchAtRef.current[sessionId] = 0
+      minimapFetchedWorldRef.current[sessionId] = currentWorld
+      minimapWorldChangedAtRef.current[sessionId] = Date.now()
+      setMinimaps((current) => {
+        if (current[sessionId] == null) return current
+        return { ...current, [sessionId]: null }
+      })
+    }
+    const now = Date.now()
+    const last = minimapFetchAtRef.current[sessionId] ?? 0
+    const recentChange = minimapWorldChangedAtRef.current[sessionId] ?? 0
+    const inWarmup = now - recentChange < 10_000
+    const minGap = inWarmup ? 500 : 4000
+    if (now - last < minGap) {
+      return
+    }
+    minimapFetchAtRef.current[sessionId] = now
     try {
       const payload = await getMinimap(sessionId)
+      const snap = payload.minimap ?? null
       setMinimaps((current) => ({
         ...current,
-        [sessionId]: payload.minimap ?? null,
+        [sessionId]: snap,
       }))
+      if (!snap) {
+        minimapFetchAtRef.current[sessionId] = now - (minGap - 500)
+      }
     } catch {
       setMinimaps((current) => ({
         ...current,
         [sessionId]: null,
       }))
+      minimapFetchAtRef.current[sessionId] = now - (minGap - 500)
     }
   }, [])
+
+  const handleHoverChange = useCallback((sessionId: string, value: string) => {
+    setHoverTiles((current) => {
+      if (current[sessionId] === value) return current
+      return { ...current, [sessionId]: value }
+    })
+  }, [])
+
+  const hoverChangeBySessionRef = useRef<Record<string, (value: string) => void>>({})
+
+  const getHoverChange = useCallback((sessionId: string) => {
+    let bound = hoverChangeBySessionRef.current[sessionId]
+    if (!bound) {
+      bound = (value: string) => handleHoverChange(sessionId, value)
+      hoverChangeBySessionRef.current[sessionId] = bound
+    }
+    return bound
+  }, [handleHoverChange])
 
   const refreshLuaStatus = useCallback(async (sessionId: string) => {
     try {
@@ -464,7 +512,7 @@ function App() {
         session.status === "awaiting_ready" ||
         session.status === "loading_world"
       ) {
-        void refreshMinimap(session.id)
+        void refreshMinimap(session.id, session.current_world)
       } else if (!session.current_world) {
         setMinimaps((current) => ({ ...current, [session.id]: null }))
       }
@@ -903,6 +951,9 @@ function App() {
                 </div>
 
                 {sessions.map((session) => {
+                  if (activeSessionId !== session.id) {
+                    return <TabsContent key={session.id} value={session.id} />
+                  }
                   const inputs = sessionInputs[session.id] ?? EMPTY_INPUTS
                   const minimap = minimaps[session.id] ?? null
                   return (
@@ -950,12 +1001,8 @@ function App() {
                             <MinimapPanel
                               minimap={minimap}
                               playerPosition={session.player_position}
-                              onHoverChange={(value) =>
-                                setHoverTiles((current) => ({
-                                  ...current,
-                                  [session.id]: value,
-                                }))
-                              }
+                              currentWorld={session.current_world}
+                              onHoverChange={getHoverChange(session.id)}
                             />
                             <div className="text-xs text-muted-foreground">
                               {hoverTiles[session.id] ?? "Hover a tile to inspect it."}
@@ -980,6 +1027,12 @@ function App() {
                                       key={`${session.id}-${item.block_id}-${item.inventory_type}`}
                                       className="grid min-w-[92px] flex-1 gap-1 rounded-xl border border-white/10 bg-white/4 p-2.5 text-center sm:min-w-[110px] sm:flex-none sm:p-3"
                                     >
+                                      <TileSprite
+                                        blockId={item.block_id}
+                                        size={40}
+                                        className="mx-auto"
+                                        fallback={<span className="text-[9px] text-muted-foreground">?</span>}
+                                      />
                                       <div className="font-mono text-[11px] text-muted-foreground">
                                         #{item.block_id}
                                       </div>
